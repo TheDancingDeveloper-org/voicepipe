@@ -12,11 +12,13 @@
 //! and the approval invariant: nothing a person *says* resolves an approval.
 //!
 //! Modules: PCM/WAV framing ([`audio`]), voice activity detection
-//! ([`vad`]), turn-taking ([`turn`]), cutting a streamed reply into
+//! ([`vad`]), turn-taking ([`turn`]), cutting a turn into chunks to
+//! transcribe while it is spoken ([`chunk`]), cutting a streamed reply into
 //! speakable pieces ([`text`]), the wire protocol ([`protocol`]) and the
 //! call itself ([`pipeline`]).
 
 pub mod audio;
+pub mod chunk;
 pub mod pipeline;
 pub mod protocol;
 pub mod text;
@@ -24,9 +26,11 @@ pub mod turn;
 pub mod vad;
 
 pub use audio::SAMPLE_RATE;
+pub use chunk::{ChunkConfig, Chunker};
 pub use pipeline::{
     run, Approvals, BoxFuture, CallConfig, Clip, Inbound, Llm, LlmEvent, LlmSink, Observer,
-    Outbound, ProviderError, Providers, ResponseReport, Stt, Tts, TurnOutcome, TurnRequest,
+    Outbound, ProviderError, Providers, ResponseReport, Stt, SttMode, Tts, TurnOutcome,
+    TurnRequest,
 };
 pub use protocol::{CallClientEvent, CallMetrics, CallResponseStatus, CallServerEvent, CallState};
 pub use text::{speakable, SentenceChunker};

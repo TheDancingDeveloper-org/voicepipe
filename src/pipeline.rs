@@ -10,12 +10,19 @@
 //! a model call, a tool loop, whatever produces the reply) and
 //! [`Approvals`]. The pipeline owns the rest:
 //!
-//! - **Turn-taking.** A [`TurnDetector`] ends the user's turn. When the user
-//!   pauses, the turn so far is transcribed at once, so the transcript is
-//!   usually ready when the turn is declared over. Live captions — a
-//!   re-transcription of the turn so far every `partial_interval_ms` — are off
-//!   unless a host turns them on: on a CPU transcriber each one is another
-//!   full decode of the whole turn, stacked on the one that matters.
+//! - **Turn-taking.** A [`TurnDetector`] ends the user's turn.
+//! - **Streaming transcription.** By default ([`SttMode::Chunked`]) the turn
+//!   is transcribed *while it is spoken*: each pause cuts the audio since the
+//!   last cut into a chunk ([`Chunker`]), and the chunks are transcribed one
+//!   at a time, in order, each with the words before it as context. Each
+//!   finished chunk is a live caption, for free. When the turn ends only the
+//!   audio after the last cut — usually none — is left, so the transcript is
+//!   ready about when the turn is declared over. If a chunk fails, the turn
+//!   falls back to one whole-clip transcription.
+//!   [`SttMode::Whole`] is the whole-clip path: the turn so far is
+//!   transcribed at each pause (discarded if the user talks on), else the
+//!   whole turn at its end; live captions there — a re-transcription every
+//!   `partial_interval_ms` — are off unless a host turns them on.
 //! - **The reply.** Streamed text is cut into sentences ([`SentenceChunker`],
 //!   the first at its first clause), each synthesized and sent the moment
 //!   it exists, in order, while the host is still producing the rest. A
@@ -44,6 +51,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::{pcm16_from_le_bytes, wav_duration, wav_from_pcm16, SAMPLE_RATE};
+use crate::chunk::{context_tail, ChunkConfig, Chunker};
 use crate::protocol::{
     CallClientEvent, CallMetrics, CallResponseStatus, CallServerEvent, CallState,
 };
@@ -76,6 +84,19 @@ pub struct Clip {
 /// Speech to text: one utterance (a 16 kHz mono PCM16 WAV) to its words.
 pub trait Stt: Send + Sync {
     fn transcribe(&self, wav: Vec<u8>) -> BoxFuture<'_, Result<String, ProviderError>>;
+
+    /// One chunk of a turn that is still being spoken. `context` is the
+    /// turn's words before this chunk (the end of them), for a transcriber
+    /// that can be told what came before — whisper's `prompt`. The default
+    /// ignores it.
+    fn transcribe_after(
+        &self,
+        wav: Vec<u8>,
+        context: String,
+    ) -> BoxFuture<'_, Result<String, ProviderError>> {
+        let _ = context;
+        self.transcribe(wav)
+    }
 }
 
 /// Text to speech: one piece of a reply to one clip.
@@ -168,6 +189,19 @@ pub struct Providers {
     pub observer: Option<Observer>,
 }
 
+/// How a turn is transcribed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SttMode {
+    /// Streamed: chunks cut at the speaker's pauses are transcribed while
+    /// they talk on (see [`crate::chunk`]). Works with any whole-clip
+    /// transcriber.
+    #[default]
+    Chunked,
+    /// Whole clips: the turn so far at each pause, discarded if the speaker
+    /// resumes, else the whole turn when it ends.
+    Whole,
+}
+
 /// Timings and fixed lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallConfig {
@@ -177,7 +211,12 @@ pub struct CallConfig {
     pub barge_in_ms: u32,
     /// Silence that counts as a pause (and starts an early transcription).
     pub pause_ms: u32,
-    /// How often a turn is re-transcribed as a caption; 0 is never.
+    /// How a turn is transcribed.
+    pub stt_mode: SttMode,
+    /// Where a streamed turn is cut ([`SttMode::Chunked`]).
+    pub chunks: ChunkConfig,
+    /// [`SttMode::Whole`] only: how often a turn is re-transcribed as a
+    /// caption; 0 is never. A chunked turn's captions cost nothing extra.
     pub partial_interval_ms: u32,
     /// Said during a tool round before any text; empty is nothing.
     pub filler: String,
@@ -201,6 +240,8 @@ impl Default for CallConfig {
             end_of_turn_ms: 700,
             barge_in_ms: 500,
             pause_ms: 200,
+            stt_mode: SttMode::Chunked,
+            chunks: ChunkConfig::default(),
             partial_interval_ms: 0,
             filler: "One moment.".into(),
             approval_reminder: "That change is waiting on your screen. Tap approve or deny there."
@@ -247,6 +288,8 @@ const MAX_AUDIO_FRAME_BYTES: usize = 64 * 1024;
 const MIN_PARTIAL_MS: u32 = 800;
 /// The silence transcribed to warm the transcriber as a call opens.
 const WARM_STT_MS: u32 = 300;
+/// How much of a streamed turn's words a chunk is given as context.
+const CONTEXT_CHARS: usize = 200;
 /// Grace after a reply should have finished playing before a client that
 /// does not report its playback is assumed to have finished.
 const PLAYBACK_SLACK: Duration = Duration::from_millis(1_500);
@@ -317,6 +360,11 @@ pub async fn run(
 /// What the call's own tasks tell the loop.
 enum Internal {
     Partial {
+        utterance: u64,
+        text: String,
+    },
+    /// A streamed turn's words so far, as its chunks are transcribed.
+    Caption {
         utterance: u64,
         text: String,
     },
@@ -397,10 +445,16 @@ struct ActiveResponse {
     cut: bool,
 }
 
+/// What transcribing a streamed turn's chunks came to: the words, or the
+/// failure that sends the turn back to one whole-clip transcription.
+type Streamed = JoinHandle<Result<String, ProviderError>>;
+
 enum Trigger {
     Speech {
         wav: Vec<u8>,
         eager: Option<JoinHandle<Option<String>>>,
+        /// A streamed turn's chunks, all sent; the task ends with the words.
+        streamed: Option<Streamed>,
     },
     Resolve {
         card_id: String,
@@ -436,6 +490,79 @@ impl Ctx {
     }
 }
 
+/// One turn streamed to the transcriber: where it is cut, and the task
+/// transcribing its chunks in order.
+struct TurnStream {
+    chunker: Chunker,
+    chunks: mpsc::UnboundedSender<Vec<u8>>,
+    task: Streamed,
+}
+
+impl TurnStream {
+    fn start(ctx: &Ctx, utterance: u64) -> Self {
+        let (chunks, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(transcribe_chunks(
+            Arc::clone(&ctx.providers.stt),
+            rx,
+            ctx.internal.clone(),
+            utterance,
+        ));
+        Self {
+            chunker: Chunker::new(ctx.config.chunks),
+            chunks,
+            task,
+        }
+    }
+
+    fn send(&self, segment: &[i16], range: std::ops::Range<usize>) {
+        let _ = self
+            .chunks
+            .send(wav_from_pcm16(&segment[range], SAMPLE_RATE));
+    }
+
+    /// The turn is over: send what is left of it and hand back the task,
+    /// which ends with the turn's words once the last chunk is done.
+    fn finish(mut self, audio: &[i16]) -> Streamed {
+        if let Some(range) = self.chunker.finish(audio) {
+            self.send(audio, range);
+        }
+        self.task
+    }
+
+    fn abort(self) {
+        self.task.abort();
+    }
+}
+
+/// Transcribe a streamed turn's chunks one at a time, in order, each told
+/// the words before it, reporting the words so far as a caption after each.
+/// One at a time keeps a single-worker transcriber's queue at one clip.
+async fn transcribe_chunks(
+    stt: Arc<dyn Stt>,
+    mut chunks: mpsc::UnboundedReceiver<Vec<u8>>,
+    internal: mpsc::UnboundedSender<Internal>,
+    utterance: u64,
+) -> Result<String, ProviderError> {
+    let mut words = String::new();
+    while let Some(wav) = chunks.recv().await {
+        let context = context_tail(&words, CONTEXT_CHARS).to_string();
+        let text = stt.transcribe_after(wav, context).await?;
+        let text = text.trim();
+        if is_non_speech(text) {
+            continue;
+        }
+        if !words.is_empty() {
+            words.push(' ');
+        }
+        words.push_str(text);
+        let _ = internal.send(Internal::Caption {
+            utterance,
+            text: words.clone(),
+        });
+    }
+    Ok(words)
+}
+
 static RESPONSES: AtomicU64 = AtomicU64::new(1);
 
 struct Call {
@@ -445,6 +572,8 @@ struct Call {
     utterance: u64,
     speech_end: Option<Instant>,
     eager: Option<JoinHandle<Option<String>>>,
+    /// The turn being streamed to the transcriber ([`SttMode::Chunked`]).
+    stream: Option<TurnStream>,
     partial_in_flight: bool,
     last_partial: Instant,
     response: Option<ActiveResponse>,
@@ -464,6 +593,7 @@ impl Call {
             utterance: 0,
             speech_end: None,
             eager: None,
+            stream: None,
             partial_in_flight: false,
             last_partial: Instant::now(),
             response: None,
@@ -506,6 +636,12 @@ impl Call {
         for event in self.detector.push(&samples) {
             self.endpoint(event);
         }
+        if let Some(stream) = self.stream.as_mut().filter(|_| self.detector.in_turn()) {
+            let segment = self.detector.segment();
+            if let Some(range) = stream.chunker.overlong(segment) {
+                stream.send(segment, range);
+            }
+        }
         self.maybe_partial();
     }
 
@@ -513,6 +649,12 @@ impl Call {
         match event {
             EndpointEvent::SpeechStarted => {
                 self.utterance += 1;
+                if let Some(old) = self.stream.take() {
+                    old.abort();
+                }
+                if self.ctx.config.stt_mode == SttMode::Chunked {
+                    self.stream = Some(TurnStream::start(&self.ctx, self.utterance));
+                }
                 self.speech_end = None;
                 self.last_partial = Instant::now();
                 self.ctx.send(CallServerEvent::SpeechStarted);
@@ -529,6 +671,13 @@ impl Call {
             EndpointEvent::PauseBegan => {
                 self.speech_end = Instant::now()
                     .checked_sub(Duration::from_millis(self.ctx.config.pause_ms as u64));
+                if let Some(stream) = self.stream.as_mut() {
+                    let segment = self.detector.segment();
+                    if let Some(range) = stream.chunker.at_pause(segment) {
+                        stream.send(segment, range);
+                    }
+                    return;
+                }
                 if let Some(old) = self.eager.take() {
                     old.abort();
                 }
@@ -538,6 +687,9 @@ impl Call {
             }
             EndpointEvent::SpeechResumed => {
                 self.speech_end = None;
+                if let Some(stream) = self.stream.as_mut() {
+                    stream.chunker.voiced();
+                }
                 if let Some(eager) = self.eager.take() {
                     eager.abort();
                 }
@@ -545,6 +697,7 @@ impl Call {
             EndpointEvent::EndOfTurn { audio, speech_ms } => {
                 self.ctx.send(CallServerEvent::SpeechStopped);
                 let eager = self.eager.take();
+                let stream = self.stream.take();
                 // Too short to have been a barge-in, said over a reply that
                 // is still going: a backchannel ("mm", "right") or echo.
                 if self.response.as_ref().is_some_and(|r| !r.cut)
@@ -553,6 +706,9 @@ impl Call {
                     if let Some(eager) = eager {
                         eager.abort();
                     }
+                    if let Some(stream) = stream {
+                        stream.abort();
+                    }
                     self.restore_state();
                     return;
                 }
@@ -560,12 +716,23 @@ impl Call {
                     Instant::now()
                         .checked_sub(Duration::from_millis(self.ctx.config.end_of_turn_ms as u64))
                 });
+                let streamed = stream.map(|stream| stream.finish(&audio));
                 let wav = wav_from_pcm16(&audio, SAMPLE_RATE);
-                self.start_response(Trigger::Speech { wav, eager }, speech_end);
+                self.start_response(
+                    Trigger::Speech {
+                        wav,
+                        eager,
+                        streamed,
+                    },
+                    speech_end,
+                );
             }
             EndpointEvent::Discarded => {
                 if let Some(eager) = self.eager.take() {
                     eager.abort();
+                }
+                if let Some(stream) = self.stream.take() {
+                    stream.abort();
                 }
                 self.restore_state();
             }
@@ -575,6 +742,7 @@ impl Call {
     fn maybe_partial(&mut self) {
         let interval = self.ctx.config.partial_interval_ms;
         if interval == 0
+            || self.ctx.config.stt_mode == SttMode::Chunked
             || self.partial_in_flight
             || !self.detector.in_turn()
             || self.eager.is_some()
@@ -767,6 +935,12 @@ impl Call {
                         .send(CallServerEvent::TranscriptionPartial { text });
                 }
             }
+            Internal::Caption { utterance, text } => {
+                if utterance == self.utterance && self.detector.in_turn() && !text.is_empty() {
+                    self.ctx
+                        .send(CallServerEvent::TranscriptionPartial { text });
+                }
+            }
             Internal::AudioStarted { response_id } => {
                 if let Some(response) = self.response.as_mut().filter(|r| r.id == response_id) {
                     response.playing = true;
@@ -831,6 +1005,9 @@ impl Call {
         }
         if let Some(eager) = self.eager.take() {
             eager.abort();
+        }
+        if let Some(stream) = self.stream.take() {
+            stream.abort();
         }
     }
 }
@@ -914,10 +1091,24 @@ async fn respond(
     };
 
     let request = match trigger {
-        Trigger::Speech { wav, eager } => {
+        Trigger::Speech {
+            wav,
+            eager,
+            streamed,
+        } => {
             let text = tokio::select! {
                 _ = cancel.cancelled() => return finished,
                 text = async {
+                    if let Some(streamed) = streamed {
+                        return match streamed.await {
+                            Ok(Ok(words)) => {
+                                let words = words.trim();
+                                (!is_non_speech(words)).then(|| words.to_string())
+                            }
+                            // A chunk failed: one whole-clip try.
+                            _ => transcribe(&*ctx.providers.stt, wav).await,
+                        };
+                    }
                     match eager {
                         Some(eager) => match eager.await {
                             Ok(Some(text)) => Some(text),

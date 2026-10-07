@@ -12,7 +12,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use voxcall::{
     run, Approvals, BoxFuture, CallConfig, Clip, Endpointer, EnergyVad, EnergyVadConfig, Inbound,
-    Llm, LlmEvent, LlmSink, Outbound, ProviderError, Providers, Stt, Tts, TurnOutcome, TurnRequest,
+    Llm, LlmEvent, LlmSink, Outbound, ProviderError, Providers, Stt, SttMode, Tts, TurnOutcome,
+    TurnRequest,
 };
 
 const RATE: u32 = 16_000;
@@ -22,6 +23,15 @@ struct World {
     transcript: String,
     /// Every clip sent to the transcriber.
     stt_calls: usize,
+    /// Scripted answers for the chunks of a streamed turn, in order (`None`
+    /// fails that chunk). Once they run out a chunk gets `transcript`.
+    chunk_texts: Vec<Option<String>>,
+    /// The context each chunk was sent with.
+    contexts: Vec<String>,
+    /// Whole-clip transcriptions (not chunks), the warm-up included.
+    whole_calls: usize,
+    /// How long a chunk takes to transcribe.
+    chunk_delay_ms: u64,
     /// Scripted replies, in order: (tool round first?, text, card?).
     replies: Vec<(bool, String, Option<Value>)>,
     requests: Vec<TurnRequest>,
@@ -39,9 +49,32 @@ impl Stt for FakeStt {
         let text = {
             let mut world = self.0.lock().unwrap();
             world.stt_calls += 1;
+            world.whole_calls += 1;
             world.transcript.clone()
         };
         Box::pin(async move { Ok(text) })
+    }
+
+    fn transcribe_after(
+        &self,
+        _wav: Vec<u8>,
+        context: String,
+    ) -> BoxFuture<'_, Result<String, ProviderError>> {
+        let (text, delay) = {
+            let mut world = self.0.lock().unwrap();
+            world.stt_calls += 1;
+            world.contexts.push(context);
+            let text = if world.chunk_texts.is_empty() {
+                Some(world.transcript.clone())
+            } else {
+                world.chunk_texts.remove(0)
+            };
+            (text, world.chunk_delay_ms)
+        };
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            text.ok_or_else(|| ProviderError("chunk refused".into()))
+        })
     }
 }
 
@@ -202,6 +235,17 @@ impl Harness {
         for frame in audio.chunks(320) {
             let bytes: Vec<u8> = frame.iter().flat_map(|s| s.to_le_bytes()).collect();
             self.tx.send(Inbound::Audio(bytes.into())).await.unwrap();
+        }
+    }
+
+    /// Speak at the pace a microphone would: one 20 ms frame per 20 ms.
+    async fn speak_live(&self, audio: &[i16]) {
+        let mut next = tokio::time::Instant::now();
+        for frame in audio.chunks(320) {
+            let bytes: Vec<u8> = frame.iter().flat_map(|s| s.to_le_bytes()).collect();
+            self.tx.send(Inbound::Audio(bytes.into())).await.unwrap();
+            next += Duration::from_millis(20);
+            tokio::time::sleep_until(next).await;
         }
     }
 
@@ -424,4 +468,177 @@ async fn a_button_for_a_card_that_is_not_waiting_is_refused() {
         .await;
     h.until(is("error")).await;
     assert!(h.world.lock().unwrap().requests.is_empty());
+}
+
+/// Two phrases with a pause between them that is shorter than the end of
+/// the turn.
+fn two_phrases() -> Vec<i16> {
+    let mut audio = quiet(300);
+    audio.extend(tone(1_200, 0.3));
+    audio.extend(quiet(400));
+    audio.extend(tone(1_000, 0.3));
+    audio.extend(quiet(1_000));
+    audio
+}
+
+fn warm_off(world: World) -> Harness {
+    start_with(
+        world,
+        CallConfig {
+            warm_stt: false,
+            ..CallConfig::default()
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_turn_is_transcribed_in_chunks_while_it_is_spoken() {
+    let mut h = warm_off(World {
+        chunk_texts: vec![
+            Some("check the build".into()),
+            Some("on the dev stack".into()),
+        ],
+        replies: vec![(false, "It passed.".into(), None)],
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.speak_live(&two_phrases()).await;
+    // The first phrase's words are out as a caption before the turn ends.
+    let caption = h
+        .until(|e| {
+            e["type"] == "conversation.item.input_audio_transcription.partial"
+                || e["type"] == "input_audio_buffer.speech_stopped"
+        })
+        .await;
+    assert_eq!(caption["text"], "check the build", "{:#?}", h.seen);
+    let done = h.until(is("response.done")).await;
+    assert_eq!(done["status"], "completed");
+    let w = h.world.lock().unwrap();
+    assert_eq!(
+        w.requests,
+        vec![TurnRequest::Utterance(
+            "check the build on the dev stack".into()
+        )]
+    );
+    assert_eq!(w.whole_calls, 0, "no whole-clip transcription");
+    assert_eq!(
+        w.contexts,
+        vec![String::new(), "check the build".to_string()],
+        "each chunk is told the words before it"
+    );
+}
+
+#[tokio::test]
+async fn the_transcript_is_ready_when_the_turn_ends_not_after() {
+    // A slow transcriber: each chunk takes 300 ms. Streamed, the first
+    // phrase is done while the second is spoken, and at the end only the
+    // second is waited for (its pause is a chunk of its own).
+    let mut h = warm_off(World {
+        chunk_texts: vec![Some("one".into()), Some("two".into())],
+        chunk_delay_ms: 300,
+        replies: vec![(false, "Okay.".into(), None)],
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.speak_live(&two_phrases()).await;
+    let done = h.until(is("response.done")).await;
+    let stt_ms = done["metrics"]["stt_ms"].as_u64().expect("stt_ms");
+    assert!(stt_ms < 300, "transcript waited {stt_ms} ms after the turn");
+    assert_eq!(
+        h.world.lock().unwrap().requests,
+        vec![TurnRequest::Utterance("one two".into())]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_chunk_falls_back_to_the_whole_clip() {
+    let mut h = warm_off(World {
+        transcript: "the whole thing".into(),
+        chunk_texts: vec![None],
+        replies: vec![(false, "Right.".into(), None)],
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.speak(&two_phrases()).await;
+    let done = h.until(is("response.done")).await;
+    assert_eq!(done["status"], "completed");
+    let w = h.world.lock().unwrap();
+    assert_eq!(w.whole_calls, 1);
+    assert_eq!(
+        w.requests,
+        vec![TurnRequest::Utterance("the whole thing".into())]
+    );
+}
+
+#[tokio::test]
+async fn a_chunk_that_heard_no_words_adds_none() {
+    let mut h = warm_off(World {
+        chunk_texts: vec![Some("[BLANK_AUDIO]".into()), Some("hello".into())],
+        replies: vec![(false, "Hi.".into(), None)],
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.speak(&two_phrases()).await;
+    h.until(is("response.done")).await;
+    assert_eq!(
+        h.world.lock().unwrap().requests,
+        vec![TurnRequest::Utterance("hello".into())]
+    );
+}
+
+#[tokio::test]
+async fn a_spoken_yes_streamed_in_chunks_still_never_approves() {
+    let card = json!({"id": "card-9", "kind": "anything"});
+    let mut h = warm_off(World {
+        transcript: "restart the service".into(),
+        replies: vec![(false, String::new(), Some(card))],
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.speak(&utterance()).await;
+    h.until(is("assistant.pending_action")).await;
+    h.until(is("response.done")).await;
+    h.world.lock().unwrap().chunk_texts = vec![Some("yes".into()), Some("approve it".into())];
+    h.speak(&two_phrases()).await;
+    let reminder = h.until(is("response.done")).await;
+    assert!(reminder["text"]
+        .as_str()
+        .unwrap()
+        .contains("on your screen"));
+    let w = h.world.lock().unwrap();
+    assert_eq!(
+        w.requests.len(),
+        1,
+        "the spoken yes never reached the model"
+    );
+    assert_eq!(w.held, vec!["yes approve it".to_string()]);
+    assert!(w.card.is_some(), "the card still waits");
+}
+
+#[tokio::test]
+async fn whole_clip_mode_transcribes_the_turn_as_one_clip() {
+    let mut h = start_with(
+        World {
+            transcript: "check the build on the dev stack".into(),
+            replies: vec![(false, "It passed.".into(), None)],
+            ..World::default()
+        },
+        CallConfig {
+            stt_mode: SttMode::Whole,
+            warm_stt: false,
+            ..CallConfig::default()
+        },
+    );
+    h.until(is("session.created")).await;
+    h.speak(&two_phrases()).await;
+    h.until(is("response.done")).await;
+    let w = h.world.lock().unwrap();
+    assert!(w.contexts.is_empty(), "no chunks in whole-clip mode");
+    assert!(w.whole_calls >= 1);
+    assert_eq!(
+        w.requests,
+        vec![TurnRequest::Utterance(
+            "check the build on the dev stack".into()
+        )]
+    );
 }
