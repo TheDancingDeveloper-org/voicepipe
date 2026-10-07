@@ -26,7 +26,7 @@ voice agent: turn-taking, barge-in, ordering and timing.
 The pipeline (`Call::run`) owns:
 
 - endpointing
-- early transcription on a pause, and partial captions
+- early transcription on a pause, and optional partial captions (off unless `partial_interval_ms` is set — each one is a full re-decode)
 - the sentence chunker (the first clause is cut early) and `speakable` markdown stripping
 - in-order synthesis that runs ahead of playback
 - a filler line during tool rounds

@@ -12,8 +12,10 @@
 //!
 //! - **Turn-taking.** A [`TurnDetector`] ends the user's turn. When the user
 //!   pauses, the turn so far is transcribed at once, so the transcript is
-//!   usually ready when the turn is declared over; while they speak, it is
-//!   re-transcribed every `partial_interval_ms` as a live caption.
+//!   usually ready when the turn is declared over. Live captions — a
+//!   re-transcription of the turn so far every `partial_interval_ms` — are off
+//!   unless a host turns them on: on a CPU transcriber each one is another
+//!   full decode of the whole turn, stacked on the one that matters.
 //! - **The reply.** Streamed text is cut into sentences ([`SentenceChunker`],
 //!   the first at its first clause), each synthesized and sent the moment
 //!   it exists, in order, while the host is still producing the rest. A
@@ -193,7 +195,7 @@ impl Default for CallConfig {
             end_of_turn_ms: 700,
             barge_in_ms: 500,
             pause_ms: 200,
-            partial_interval_ms: 1_500,
+            partial_interval_ms: 0,
             filler: "One moment.".into(),
             approval_reminder: "That change is waiting on your screen. Tap approve or deny there."
                 .into(),
