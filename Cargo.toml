@@ -2,7 +2,7 @@
 name = "voxcall"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 description = "A pipeline for live, turn-taking voice calls with a language model: VAD, endpointing, barge-in, sentence-streamed speech"
 keywords = ["voice", "vad", "speech", "llm", "realtime"]
