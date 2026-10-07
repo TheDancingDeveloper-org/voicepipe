@@ -187,6 +187,12 @@ pub struct CallConfig {
     pub proposed_line: String,
     /// Said when a turn fails without having said anything.
     pub failed_line: String,
+    /// Transcribe a moment of silence as the call opens, and throw the words
+    /// away. A self-hosted transcriber commonly unloads an idle model (the
+    /// default for speaches is five minutes), and reloading it costs several
+    /// seconds; warming it while the person is still drawing breath keeps
+    /// that off the first turn.
+    pub warm_stt: bool,
 }
 
 impl Default for CallConfig {
@@ -201,6 +207,7 @@ impl Default for CallConfig {
                 .into(),
             proposed_line: "I've put that change on your screen for you to approve.".into(),
             failed_line: "Sorry, I couldn't get an answer just then.".into(),
+            warm_stt: true,
         }
     }
 }
@@ -238,6 +245,8 @@ pub enum Outbound {
 const MAX_AUDIO_FRAME_BYTES: usize = 64 * 1024;
 /// A partial caption needs at least this much of the turn to say anything.
 const MIN_PARTIAL_MS: u32 = 800;
+/// The silence transcribed to warm the transcriber as a call opens.
+const WARM_STT_MS: u32 = 300;
 /// Grace after a reply should have finished playing before a client that
 /// does not report its playback is assumed to have finished.
 const PLAYBACK_SLACK: Duration = Duration::from_millis(1_500);
@@ -259,6 +268,15 @@ pub async fn run(
         internal: internal_tx,
         clips: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
+    // Load the transcriber's model before the first turn needs it. The
+    // words are discarded, and a failure here is the first turn's to report.
+    if ctx.config.warm_stt {
+        let stt = Arc::clone(&ctx.providers.stt);
+        tokio::spawn(async move {
+            let silence = vec![0i16; (SAMPLE_RATE / 1000 * WARM_STT_MS) as usize];
+            let _ = stt.transcribe(wav_from_pcm16(&silence, SAMPLE_RATE)).await;
+        });
+    }
     // Warm the fixed lines so the first time one is needed it is instant.
     {
         let ctx = ctx.clone();

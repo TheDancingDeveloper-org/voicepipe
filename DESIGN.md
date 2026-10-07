@@ -26,6 +26,7 @@ voice agent: turn-taking, barge-in, ordering and timing.
 The pipeline (`Call::run`) owns:
 
 - endpointing
+- a warm-up transcription of silence as the call opens (`warm_stt`), so an idle-unloaded model is loaded before the first turn
 - early transcription on a pause, and optional partial captions (off unless `partial_interval_ms` is set — each one is a full re-decode)
 - the sentence chunker (the first clause is cut early) and `speakable` markdown stripping
 - in-order synthesis that runs ahead of playback

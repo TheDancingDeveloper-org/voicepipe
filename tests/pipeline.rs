@@ -20,6 +20,8 @@ const RATE: u32 = 16_000;
 #[derive(Default)]
 struct World {
     transcript: String,
+    /// Every clip sent to the transcriber.
+    stt_calls: usize,
     /// Scripted replies, in order: (tool round first?, text, card?).
     replies: Vec<(bool, String, Option<Value>)>,
     requests: Vec<TurnRequest>,
@@ -34,7 +36,11 @@ type W = Arc<Mutex<World>>;
 struct FakeStt(W);
 impl Stt for FakeStt {
     fn transcribe(&self, _wav: Vec<u8>) -> BoxFuture<'_, Result<String, ProviderError>> {
-        let text = self.0.lock().unwrap().transcript.clone();
+        let text = {
+            let mut world = self.0.lock().unwrap();
+            world.stt_calls += 1;
+            world.transcript.clone()
+        };
         Box::pin(async move { Ok(text) })
     }
 }
@@ -129,11 +135,17 @@ struct Harness {
 }
 
 fn start(world: World) -> Harness {
+    start_with(
+        world,
+        CallConfig {
+            partial_interval_ms: 0,
+            ..CallConfig::default()
+        },
+    )
+}
+
+fn start_with(world: World, config: CallConfig) -> Harness {
     let world = Arc::new(Mutex::new(world));
-    let config = CallConfig {
-        partial_interval_ms: 0,
-        ..CallConfig::default()
-    };
     let detector = Box::new(Endpointer::new(
         config.endpoint_config(),
         EnergyVad::new(EnergyVadConfig::default()),
@@ -221,6 +233,39 @@ impl Harness {
 
 fn is(kind: &'static str) -> impl Fn(&Value) -> bool {
     move |e| e["type"] == kind
+}
+
+#[tokio::test]
+async fn opening_a_call_warms_the_transcriber_before_anyone_speaks() {
+    let mut h = start(World::default());
+    h.until(is("session.created")).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while h.world.lock().unwrap().stt_calls == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no warm-up transcription"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The warm-up's words go nowhere: no turn, no response.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h.world.lock().unwrap().stt_calls, 1);
+    assert!(h.world.lock().unwrap().requests.is_empty());
+    assert!(!h.seen.iter().any(|e| e["type"] == "response.created"));
+}
+
+#[tokio::test]
+async fn a_host_can_turn_the_warm_up_off() {
+    let mut h = start_with(
+        World::default(),
+        CallConfig {
+            warm_stt: false,
+            ..CallConfig::default()
+        },
+    );
+    h.until(is("session.created")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(h.world.lock().unwrap().stt_calls, 0);
 }
 
 #[tokio::test]
