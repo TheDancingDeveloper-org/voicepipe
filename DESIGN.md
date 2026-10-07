@@ -17,7 +17,7 @@ voice agent: turn-taking, barge-in, ordering and timing.
 |---|---|---|
 | `Vad` | 16 kHz PCM16 frame → speech probability; told when the reply is playing (echo guard) | `EarshotVad` (default; pure Rust, MIT/Apache, no runtime deps) and `EnergyVad` (adaptive noise floor, zero deps) |
 | `TurnDetector` | turns VAD decisions into events: speech started, sustained (the barge-in bar), pause (early-STT trigger), resumed, end of turn, discarded. A hook can lengthen the end-of-turn wait from the transcript so far (semantic endpointing) | `SilenceTurnDetector` (onset, hangover and pre-roll timings) |
-| `Stt` | one utterance (a 16 kHz WAV) → text. The pipeline hides the latency with early transcription on a pause. A streaming-recognizer method is a later addition | host-provided |
+| `Stt` | one clip (a 16 kHz WAV) → text; `transcribe_after(clip, context)` takes one chunk of a turn still being spoken plus the words before it (whisper's `prompt`), defaulting to `transcribe`. A recognizer that decodes audio incrementally would be a further method; none of the whisper servers does | host-provided |
 | `Llm` | *the host's turn*: a `TurnRequest` (`Utterance` or `Resolve`) in; text deltas and `ToolRound` events out; honours a `CancellationToken`; returns `Completed`, `Interrupted` or `AwaitingApproval { card }` (the card is opaque JSON with a string `id`). It also has `truncate_reply(heard)` | host-provided; Vogt's is its assistant runtime |
 | `Tts` | text → one audio clip (content type and bytes) | host-provided |
 | `Approvals` | host callback: is a card waiting (`pending`)? An utterance was held (`held_utterance`). Resolution is *not* here: it is `TurnRequest::Resolve`, built only from a button frame | host-provided |
@@ -27,7 +27,8 @@ The pipeline (`Call::run`) owns:
 
 - endpointing
 - a warm-up transcription of silence as the call opens (`warm_stt`), so an idle-unloaded model is loaded before the first turn
-- early transcription on a pause, and optional partial captions (off unless `partial_interval_ms` is set — each one is a full re-decode)
+- streaming transcription by chunks (`SttMode::Chunked`, the default, in `chunk.rs`): a turn is cut at the speaker's pauses (and, after `max_ms` of unbroken speech, at its quietest frame), the chunks are transcribed one at a time in order while the speaker talks on, each told the words before it, and each finished chunk is a caption. At the end of the turn only the audio after the last cut is left, with the end-of-turn silence trimmed. A failed chunk falls back to one whole-clip transcription
+- `SttMode::Whole`, the whole-clip path: early transcription of the turn so far on a pause, discarded if the speaker resumes, and optional partial captions (off unless `partial_interval_ms` is set — each one is a full re-decode)
 - the sentence chunker (the first clause is cut early) and `speakable` markdown stripping
 - in-order synthesis that runs ahead of playback
 - a filler line during tool rounds

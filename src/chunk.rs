@@ -182,6 +182,57 @@ pub fn context_tail(text: &str, max_chars: usize) -> &str {
     }
 }
 
+/// Whether `text` is more words than `seconds` of speech can hold, or
+/// repeats itself in a run: the two signs of a whisper decode that looped
+/// (it does, on a short clip given a prompt, or on a long silence) instead of
+/// transcribing.
+pub fn implausible(text: &str, seconds: f32) -> bool {
+    let words = text.split_whitespace().count() as f32;
+    words > MAX_WORDS_PER_SECOND * seconds + 4.0
+        || collapse_repeats(text) != text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Brisk speech is about four words a second; past this a transcript is
+/// not of the clip.
+const MAX_WORDS_PER_SECOND: f32 = 6.0;
+/// The longest phrase looked for repeating, in words.
+const MAX_REPEAT_WORDS: usize = 12;
+/// A phrase said this many times running is a loop, not speech.
+const LOOP_RUN: usize = 3;
+
+/// `text` with any phrase repeated `LOOP_RUN` or more times running cut back
+/// to one saying of it ("passed passed passed passed" → "passed"). Words are
+/// compared without case or punctuation.
+pub fn collapse_repeats(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let key = |w: &str| {
+        w.trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase()
+    };
+    let keys: Vec<String> = words.iter().map(|w| key(w)).collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(words.len());
+    let mut at = 0;
+    'scan: while at < words.len() {
+        for n in 1..=MAX_REPEAT_WORDS.min((words.len() - at) / LOOP_RUN) {
+            let unit = &keys[at..at + n];
+            let mut runs = 1;
+            while at + (runs + 1) * n <= words.len()
+                && keys[at + runs * n..at + (runs + 1) * n] == *unit
+            {
+                runs += 1;
+            }
+            if runs >= LOOP_RUN {
+                kept.extend_from_slice(&words[at..at + n]);
+                at += runs * n;
+                continue 'scan;
+            }
+        }
+        kept.push(words[at]);
+        at += 1;
+    }
+    kept.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +332,29 @@ mod tests {
         segment.extend(hush(700));
         let tail = chunker.finish(&segment).expect("the whole turn");
         assert_eq!(tail, 0..ms(1_100));
+    }
+
+    #[test]
+    fn a_looping_decode_is_caught_and_cut_back() {
+        assert_eq!(
+            collapse_repeats("tell me whether the tests passed passed passed passed"),
+            "tell me whether the tests passed"
+        );
+        assert_eq!(
+            collapse_repeats(
+                "Check the build. You can check the build, you can check the build, \
+                 you can check the build, you can check the build"
+            ),
+            "Check the build. You can check the build"
+        );
+        // Said twice is speech.
+        assert_eq!(collapse_repeats("no no I meant that"), "no no I meant that");
+        assert!(implausible("passed passed passed passed", 2.0));
+        assert!(implausible(&"word ".repeat(40), 2.0), "40 words in 2 s");
+        assert!(!implausible(
+            "Can you check the build on the dev stack?",
+            2.5
+        ));
     }
 
     #[test]

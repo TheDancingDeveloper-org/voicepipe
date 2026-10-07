@@ -51,7 +51,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::{pcm16_from_le_bytes, wav_duration, wav_from_pcm16, SAMPLE_RATE};
-use crate::chunk::{context_tail, ChunkConfig, Chunker};
+use crate::chunk::{collapse_repeats, context_tail, implausible, ChunkConfig, Chunker};
 use crate::protocol::{
     CallClientEvent, CallMetrics, CallResponseStatus, CallServerEvent, CallState,
 };
@@ -494,7 +494,8 @@ impl Ctx {
 /// transcribing its chunks in order.
 struct TurnStream {
     chunker: Chunker,
-    chunks: mpsc::UnboundedSender<Vec<u8>>,
+    /// Each chunk's WAV and how many seconds it holds.
+    chunks: mpsc::UnboundedSender<(Vec<u8>, f32)>,
     task: Streamed,
 }
 
@@ -515,9 +516,10 @@ impl TurnStream {
     }
 
     fn send(&self, segment: &[i16], range: std::ops::Range<usize>) {
+        let seconds = range.len() as f32 / SAMPLE_RATE as f32;
         let _ = self
             .chunks
-            .send(wav_from_pcm16(&segment[range], SAMPLE_RATE));
+            .send((wav_from_pcm16(&segment[range], SAMPLE_RATE), seconds));
     }
 
     /// The turn is over: send what is left of it and hand back the task,
@@ -537,16 +539,30 @@ impl TurnStream {
 /// Transcribe a streamed turn's chunks one at a time, in order, each told
 /// the words before it, reporting the words so far as a caption after each.
 /// One at a time keeps a single-worker transcriber's queue at one clip.
+///
+/// A decode that looped — far more words than the chunk could hold, or a
+/// phrase over and over, which whisper models do on a short clip given a
+/// prompt — is tried again without the context, and if it loops again its
+/// repeats are cut back to one.
 async fn transcribe_chunks(
     stt: Arc<dyn Stt>,
-    mut chunks: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut chunks: mpsc::UnboundedReceiver<(Vec<u8>, f32)>,
     internal: mpsc::UnboundedSender<Internal>,
     utterance: u64,
 ) -> Result<String, ProviderError> {
     let mut words = String::new();
-    while let Some(wav) = chunks.recv().await {
+    while let Some((wav, seconds)) = chunks.recv().await {
         let context = context_tail(&words, CONTEXT_CHARS).to_string();
-        let text = stt.transcribe_after(wav, context).await?;
+        let retry = (!context.is_empty()).then(|| wav.clone());
+        let mut text = stt.transcribe_after(wav, context).await?;
+        if implausible(&text, seconds) {
+            if let Some(wav) = retry {
+                text = stt.transcribe_after(wav, String::new()).await?;
+            }
+            if implausible(&text, seconds) {
+                text = collapse_repeats(&text);
+            }
+        }
         let text = text.trim();
         if is_non_speech(text) {
             continue;

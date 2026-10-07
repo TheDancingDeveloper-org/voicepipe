@@ -642,3 +642,32 @@ async fn whole_clip_mode_transcribes_the_turn_as_one_clip() {
         )]
     );
 }
+
+#[tokio::test]
+async fn a_chunk_that_loops_is_retried_without_its_context() {
+    let mut h = warm_off(World {
+        chunk_texts: vec![
+            Some("check the build".into()),
+            // Given the first chunk as its prompt, the second loops on it.
+            Some("check the build check the build check the build check the build".into()),
+            Some("and the tests".into()),
+        ],
+        replies: vec![(false, "Okay.".into(), None)],
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.speak(&two_phrases()).await;
+    h.until(is("response.done")).await;
+    let w = h.world.lock().unwrap();
+    assert_eq!(
+        w.requests,
+        vec![TurnRequest::Utterance(
+            "check the build and the tests".into()
+        )]
+    );
+    assert_eq!(
+        w.contexts,
+        vec![String::new(), "check the build".into(), String::new()],
+        "the retry went without the context"
+    );
+}
