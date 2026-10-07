@@ -17,11 +17,11 @@ voice agent: turn-taking, barge-in, ordering and timing.
 |---|---|---|
 | `Vad` | 16 kHz PCM16 frame → speech probability; told when the reply is playing (echo guard) | `EarshotVad` (default; pure Rust, MIT/Apache, no runtime deps) and `EnergyVad` (adaptive noise floor, zero deps) |
 | `TurnDetector` | turns VAD decisions into events: speech started, sustained (the barge-in bar), pause (early-STT trigger), resumed, end of turn, discarded. A hook can lengthen the end-of-turn wait from the transcript so far (semantic endpointing) | `SilenceTurnDetector` (onset, hangover and pre-roll timings) |
-| `Stt` | utterance PCM → text (`transcribe`); optional `stream()` for true streaming recognizers | host-provided; a feature-gated `openai` adapter (`/audio/transcriptions`) |
-| `Llm` | *the host's turn*: text in, streamed text deltas plus "tool round started" events out, honours a `CancellationToken`, returns an outcome (`Completed`, `Interrupted`, `AwaitingApproval { card: serde_json::Value }`, `Failed`) | host-provided; Vogt's is its assistant runtime |
-| `Tts` | text → one audio clip (content type and bytes) | host-provided; a feature-gated `openai` adapter (`/audio/speech`) |
-| `Approvals` | host callback: is a card waiting?; what to say when it is; resolve card `id` | host-provided |
-| `Transport` | inbound audio frames and control events, outbound events and clips | a feature-gated `axum` WebSocket adapter; the host authenticates *before* handing over the socket |
+| `Stt` | one utterance (a 16 kHz WAV) → text. The pipeline hides the latency with early transcription on a pause. A streaming-recognizer method is a later addition | host-provided |
+| `Llm` | *the host's turn*: a `TurnRequest` (`Utterance` or `Resolve`) in; text deltas and `ToolRound` events out; honours a `CancellationToken`; returns `Completed`, `Interrupted` or `AwaitingApproval { card }` (the card is opaque JSON with a string `id`). It also has `truncate_reply(heard)` | host-provided; Vogt's is its assistant runtime |
+| `Tts` | text → one audio clip (content type and bytes) | host-provided |
+| `Approvals` | host callback: is a card waiting (`pending`)? An utterance was held (`held_utterance`). Resolution is *not* here: it is `TurnRequest::Resolve`, built only from a button frame | host-provided |
+| transport | two channels: `Inbound` (audio frames, control JSON) and `Outbound` (typed events, clips). Bridging them to a WebSocket is about 25 lines of host code, and the host authenticates *before* bridging | none; Vogt's axum bridge lives in Vogt |
 
 The pipeline (`Call::run`) owns:
 
@@ -38,9 +38,9 @@ The pipeline (`Call::run`) owns:
 
 - an utterance is handed to `Approvals::held_utterance` and answered with the host's reminder;
 - the utterance never reaches `Llm`;
-- `Approvals::resolve` is called *only* for an explicit `action.resolve` control frame from the transport, which is a button press. No audio or transcript path can reach it.
+- `TurnRequest::Resolve` is constructed *only* from an explicit `action.resolve` control frame from the transport, which is a button press. No audio or transcript path can reach it.
 
-The tests assert that a spoken "yes" leaves the card pending and makes no model call.
+`tests/pipeline.rs` asserts that a spoken "yes" leaves the card pending and makes no model call. Vogt asserts the same end to end.
 
 ### What earshot is, and what it is not
 
@@ -56,7 +56,7 @@ and the turn detector's minimum speech length absorbs that blip.
 
 ## Reusable versus Vogt-specific
 
-The crate depends on tokio, tokio-util, serde/serde_json, bytes, futures-util and earshot. axum and reqwest come in only through the optional adapters. It holds no Vogt type, configuration key or path.
+The crate depends on tokio, tokio-util, serde/serde_json, bytes and (default feature) earshot. `cargo package -p voxcall` builds it standalone. It holds no Vogt type, configuration key or path.
 
 What stays in Vogt (`engine/server/src/call.rs`, as a consumer):
 

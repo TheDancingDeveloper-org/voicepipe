@@ -11,16 +11,24 @@
 //! runs over local models or hosted APIs. See `DESIGN.md` for the boundary
 //! and the approval invariant: nothing a person *says* resolves an approval.
 //!
-//! This release carries the pure building blocks: PCM/WAV framing
-//! ([`audio`]), voice activity detection ([`vad`]), turn-taking ([`turn`]),
-//! and cutting a streamed reply into speakable pieces ([`text`]).
+//! Modules: PCM/WAV framing ([`audio`]), voice activity detection
+//! ([`vad`]), turn-taking ([`turn`]), cutting a streamed reply into
+//! speakable pieces ([`text`]), the wire protocol ([`protocol`]) and the
+//! call itself ([`pipeline`]).
 
 pub mod audio;
+pub mod pipeline;
+pub mod protocol;
 pub mod text;
 pub mod turn;
 pub mod vad;
 
 pub use audio::SAMPLE_RATE;
+pub use pipeline::{
+    run, Approvals, BoxFuture, CallConfig, Clip, Inbound, Llm, LlmEvent, LlmSink, Observer,
+    Outbound, ProviderError, Providers, ResponseReport, Stt, Tts, TurnOutcome, TurnRequest,
+};
+pub use protocol::{CallClientEvent, CallMetrics, CallResponseStatus, CallServerEvent, CallState};
 pub use text::{speakable, SentenceChunker};
 pub use turn::{EndpointConfig, EndpointEvent, Endpointer, TurnDetector};
 #[cfg(feature = "earshot")]

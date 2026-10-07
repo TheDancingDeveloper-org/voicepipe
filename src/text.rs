@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn markdown_is_said_the_way_a_reader_would_see_it() {
-        assert_eq!(speakable("**ABC-123** is `open`."), "ABC-123 is open.");
+        assert_eq!(speakable("**ISSUE-42** is `open`."), "ISSUE-42 is open.");
         assert_eq!(
             speakable("- see [the PR](https://x.y/1) now"),
             "see the PR now"
