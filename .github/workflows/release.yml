@@ -1,0 +1,93 @@
+name: release
+
+# A `v*` tag publishes that version to crates.io. The gates run first, then
+# the publish job waits in the `release` environment until a required
+# reviewer approves it, so pushing a tag is never enough on its own.
+#
+# There is no crates.io token in this repository. The publish job trades the
+# workflow's GitHub OIDC identity for a short-lived crates.io token
+# (trusted publishing), which crates.io issues only to this repository, this
+# workflow file and the `release` environment, as configured on the crate's
+# crates.io settings page.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: [self-hosted]
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: the tag names the crate's version
+        id: check
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  gates:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [version, gates]
+    runs-on: [self-hosted]
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+
+      # 0.1.0 was published by hand, to establish the crate's owner; its tag
+      # arrives afterwards and has nothing left to do. A version can never be
+      # published twice, so this only turns that failure into a notice.
+      - name: is this version on crates.io already
+        id: published
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -A 'voicepipe-release (github.com/TheDancingDeveloper-org/voicepipe)' \
+            "https://crates.io/api/v1/crates/voicepipe/$VERSION")"
+          case "$status" in
+            200) echo "already=true" >> "$GITHUB_OUTPUT"
+                 echo "::notice::voicepipe $VERSION is already on crates.io; not publishing" ;;
+            404) echo "already=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "::error::crates.io answered $status"; exit 1 ;;
+          esac
+
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        if: steps.published.outputs.already == 'false'
+        id: auth
+
+      - name: cargo publish
+        if: steps.published.outputs.already == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
