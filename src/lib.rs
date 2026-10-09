@@ -1,21 +1,12 @@
-//! # voicepipe
+#![doc = include_str!("../README.md")]
 //!
-//! A pipeline for live, turn-taking voice calls with a language model: audio
-//! streams in, the pipeline decides when the speaker's turn is over,
-//! transcribes it, runs the host's turn, and speaks the reply back a
-//! sentence at a time while it is still being written — and stops it the
-//! moment the speaker talks over it.
+//! ## Modules
 //!
-//! Every provider is a trait (`Vad`, `TurnDetector`, and — with the pipeline
-//! — `Stt`, `Llm`, `Tts`, `Approvals`, `Transport`), so the same pipeline
-//! runs over local models or hosted APIs. See `DESIGN.md` for the boundary
-//! and the approval invariant: nothing a person *says* resolves an approval.
-//!
-//! Modules: PCM/WAV framing ([`audio`]), voice activity detection
-//! ([`vad`]), turn-taking ([`turn`]), cutting a turn into chunks to
-//! transcribe while it is spoken ([`chunk`]), cutting a streamed reply into
-//! speakable pieces ([`text`]), the wire protocol ([`protocol`]) and the
-//! call itself ([`pipeline`]).
+//! PCM/WAV framing ([`audio`]), voice activity detection ([`vad`]),
+//! turn-taking ([`turn`]), cutting a turn into chunks to transcribe while it
+//! is spoken ([`chunk`]), cutting a streamed reply into speakable pieces
+//! ([`text`]), the wire protocol ([`protocol`]) and the call itself
+//! ([`pipeline`]).
 
 pub mod audio;
 pub mod chunk;

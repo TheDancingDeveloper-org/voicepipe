@@ -1,12 +1,11 @@
-# voxcall — design note
+# voicepipe — design note
 
-`voxcall` is a transport-agnostic Rust pipeline for live, turn-taking voice
+`voicepipe` is a transport-agnostic Rust pipeline for live, turn-taking voice
 calls. A microphone streams in and the pipeline decides when a turn is over,
 transcribes it, runs the host's turn, speaks the reply a sentence at a time,
-and stops when the user talks over it. It was written for Vogt and
-is kept free of Vogt types so it can move to its own repository and be
-published on crates.io. "voxcall" is a working name; it is free on crates.io
-as of 2026-10-07.
+and stops when the user talks over it. It began as the call path of
+[Vogt](https://github.com/TheDancingDeveloper-org/vogt) and holds no type,
+configuration key or path of any host.
 
 ## The boundary
 
@@ -15,15 +14,15 @@ voice agent: turn-taking, barge-in, ordering and timing.
 
 | Trait | Contract | Shipped implementations |
 |---|---|---|
-| `Vad` | 16 kHz PCM16 frame → speech probability; told when the reply is playing (echo guard) | `EarshotVad` (default; pure Rust, MIT/Apache, no runtime deps) and `EnergyVad` (adaptive noise floor, zero deps) |
-| `TurnDetector` | turns VAD decisions into events: speech started, sustained (the barge-in bar), pause (early-STT trigger), resumed, end of turn, discarded. A hook can lengthen the end-of-turn wait from the transcript so far (semantic endpointing) | `SilenceTurnDetector` (onset, hangover and pre-roll timings) |
+| `Vad` | 16 kHz PCM16 frame → speech or not; told when the reply is playing (echo guard) | `EarshotVad` (default; pure Rust, MIT/Apache, no runtime deps) and `EnergyVad` (adaptive noise floor, zero deps) |
+| `TurnDetector` | turns VAD decisions into events: speech started, sustained (the barge-in bar), pause (early-STT trigger), resumed, end of turn, discarded. The end of turn is decided on silence alone; there is no semantic-endpointing hook yet | `Endpointer` (onset, hangover and pre-roll timings) |
 | `Stt` | one clip (a 16 kHz WAV) → text; `transcribe_after(clip, context)` takes one chunk of a turn still being spoken plus the words before it (whisper's `prompt`), defaulting to `transcribe`. A recognizer that decodes audio incrementally would be a further method; none of the whisper servers does | host-provided |
-| `Llm` | *the host's turn*: a `TurnRequest` (`Utterance` or `Resolve`) in; text deltas and `ToolRound` events out; honours a `CancellationToken`; returns `Completed`, `Interrupted` or `AwaitingApproval { card }` (the card is opaque JSON with a string `id`). It also has `truncate_reply(heard)` | host-provided; Vogt's is its assistant runtime |
+| `Llm` | *the host's turn*: a `TurnRequest` (`Utterance` or `Resolve`) in; text deltas and `ToolRound` events out; honours a `CancellationToken`; returns `Completed`, `Interrupted` or `AwaitingApproval { card }` (the card is opaque JSON with a string `id`). It also has `truncate_reply(heard)` | host-provided |
 | `Tts` | text → one audio clip (content type and bytes) | host-provided |
 | `Approvals` | host callback: is a card waiting (`pending`)? An utterance was held (`held_utterance`). Resolution is *not* here: it is `TurnRequest::Resolve`, built only from a button frame | host-provided |
-| transport | two channels: `Inbound` (audio frames, control JSON) and `Outbound` (typed events, clips). Bridging them to a WebSocket is about 25 lines of host code, and the host authenticates *before* bridging | none; Vogt's axum bridge lives in Vogt |
+| transport | two channels: `Inbound` (audio frames, control JSON) and `Outbound` (typed events, clips). Bridging them to a WebSocket is about 25 lines of host code, and the host authenticates *before* bridging | host-provided; there is no `Transport` trait |
 
-The pipeline (`Call::run`) owns:
+The pipeline (`run`) owns:
 
 - endpointing
 - a warm-up transcription of silence as the call opens (`warm_stt`), so an idle-unloaded model is loaded before the first turn
@@ -42,12 +41,12 @@ The pipeline (`Call::run`) owns:
 - the utterance never reaches `Llm`;
 - `TurnRequest::Resolve` is constructed *only* from an explicit `action.resolve` control frame from the transport, which is a button press. No audio or transcript path can reach it.
 
-`tests/pipeline.rs` asserts that a spoken "yes" leaves the card pending and makes no model call. Vogt asserts the same end to end.
+`tests/pipeline.rs` asserts that a spoken "yes" leaves the card pending and makes no model call.
 
 ### What earshot is, and what it is not
 
 earshot answers one question: is there voice in these 16 ms? Everything
-else on the list above belongs to voxcall, and earshot is just its default
+else on the list above belongs to voicepipe, and earshot is just its default
 `Vad`. Wrapping it surfaced a defect. After exact digital silence, which
 browser noise suppression emits between words, earshot's level estimate
 collapses and it scores everything as voice, silence included (measured
@@ -56,17 +55,9 @@ copy of each frame (±32 LSB, about -60 dBFS). The dither never reaches the
 transcriber. earshot also takes about 300 ms to settle on a new noise floor,
 and the turn detector's minimum speech length absorbs that blip.
 
-## Reusable versus Vogt-specific
+## Dependencies
 
-The crate depends on tokio, tokio-util, serde/serde_json, bytes and (default feature) earshot. `cargo package -p voxcall` builds it standalone. It holds no Vogt type, configuration key or path.
-
-What stays in Vogt (`engine/server/src/call.rs`, as a consumer):
-
-- **The turn.** `AssistantRuntime::handle_message_streamed` and `resolve_action_streamed` implement `Llm`. That keeps the tool loop, untrusted-data delimiting, the durable log, profiles and the call-style system note.
-- **Speech.** `AssistantSpeech` implements `Stt` and `Tts`, with the ordered fallback lists.
-- **Approvals.** `Approvals` is backed by the runtime's pending card, `resolve_action_streamed` with the call's authenticated `Caller`, and `record_held_utterance`.
-- **The route and its guards.** These are the route itself (`/api/assistant/call`), first-frame bearer authentication and the `assistant` capability, the one-call slot, the `/api/config` advertisement, and the mapping of `ENGINE_ASSISTANT_CALL_*` settings onto `voxcall::CallConfig`.
-- **The card's JSON shape** (`PendingAction`), which the crate carries as opaque `serde_json::Value`.
+The crate depends on tokio, tokio-util, serde/serde_json, bytes and (default feature) earshot.
 
 ## Prior art (checked 2026-10-07)
 
