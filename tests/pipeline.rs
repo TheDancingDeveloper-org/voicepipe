@@ -10,7 +10,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use voxcall::{
+use voicepipe::{
     run, Approvals, BoxFuture, CallConfig, Clip, Endpointer, EnergyVad, EnergyVadConfig, Inbound,
     Llm, LlmEvent, LlmSink, Outbound, ProviderError, Providers, Stt, SttMode, Tts, TurnOutcome,
     TurnRequest,
@@ -80,7 +80,7 @@ impl Stt for FakeStt {
 
 fn wav(ms: u32) -> Bytes {
     let samples = vec![0i16; (24_000 * ms / 1000) as usize];
-    Bytes::from(voxcall::audio::wav_from_pcm16(&samples, 24_000))
+    Bytes::from(voicepipe::audio::wav_from_pcm16(&samples, 24_000))
 }
 
 struct FakeTts(W);

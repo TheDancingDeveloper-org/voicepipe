@@ -1,4 +1,4 @@
-//! # voxcall
+//! # voicepipe
 //!
 //! A pipeline for live, turn-taking voice calls with a language model: audio
 //! streams in, the pipeline decides when the speaker's turn is over,
