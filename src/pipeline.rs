@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -335,6 +335,16 @@ impl Default for CallConfig {
 }
 
 impl CallConfig {
+    /// The lines said as they are, synthesized once per call and reused.
+    fn fixed_lines(&self) -> [&str; 4] {
+        [
+            &self.filler,
+            &self.approval_reminder,
+            &self.proposed_line,
+            &self.failed_line,
+        ]
+    }
+
     /// The turn detector timings these settings imply.
     pub fn endpoint_config(&self) -> EndpointConfig {
         EndpointConfig {
@@ -416,17 +426,14 @@ pub async fn run(
     {
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            for line in [
-                ctx.config.filler.clone(),
-                ctx.config.approval_reminder.clone(),
-            ] {
+            for line in ctx.config.fixed_lines() {
                 if !line.is_empty() {
-                    ctx.canned(&line).await;
+                    ctx.canned(line).await;
                 }
             }
         });
     }
-    let mut call = Call::new(ctx, turn_detector);
+    let mut call = Call::new(ctx, call_id.clone(), turn_detector);
     call.ctx.send(CallServerEvent::SessionCreated {
         protocol: PROTOCOL_VERSION,
         call_id,
@@ -438,6 +445,9 @@ pub async fn run(
         state: CallState::Listening,
     });
     loop {
+        // A client that sends no audio (muted) still leaves `Speaking` when
+        // the reply should have finished playing.
+        let playback_deadline = call.playback_deadline();
         tokio::select! {
             message = inbound.recv() => match message {
                 Some(Inbound::Audio(bytes)) => call.audio(&bytes),
@@ -445,9 +455,18 @@ pub async fn run(
                 None => break,
             },
             Some(internal) = internal_rx.recv() => call.internal(internal),
+            () = sleep_until_some(playback_deadline), if playback_deadline.is_some() => {
+                call.expire_estimated_playback();
+            }
         }
     }
     call.hang_up();
+}
+
+async fn sleep_until_some(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    }
 }
 
 /// What the call's own tasks tell the loop.
@@ -464,6 +483,13 @@ enum Internal {
     /// A response's first audio went out.
     AudioStarted {
         response_id: String,
+    },
+    /// A button for a card this call had not seen, checked against the
+    /// host's waiting card: `waiting` if it is that card.
+    ResolveChecked {
+        card_id: String,
+        approve: bool,
+        waiting: bool,
     },
     Finished(Box<Finished>),
 }
@@ -535,7 +561,6 @@ struct ActiveResponse {
     shared: Arc<Mutex<Shared>>,
     generating: bool,
     playing: bool,
-    cut: bool,
 }
 
 /// What transcribing a streamed turn's chunks came to: the words, or the
@@ -672,10 +697,11 @@ async fn transcribe_chunks(
     Ok(words)
 }
 
-static RESPONSES: AtomicU64 = AtomicU64::new(1);
-
 struct Call {
     ctx: Ctx,
+    call_id: String,
+    /// Responses started so far, for their ids.
+    responses: u64,
     detector: Box<dyn TurnDetector>,
     state: CallState,
     utterance: u64,
@@ -690,15 +716,19 @@ struct Call {
     /// so a cut reply is truncated before a new turn lands.
     finishing: Option<JoinHandle<()>>,
     pending_card: Option<String>,
-    client_reports: bool,
+    /// The client reports its playback (`output_audio.*`). Shared with the
+    /// response tasks, which learn it as soon as the first report arrives.
+    client_reports: Arc<AtomicBool>,
     /// An oversized audio frame has been reported already.
     oversized_reported: bool,
 }
 
 impl Call {
-    fn new(ctx: Ctx, detector: Box<dyn TurnDetector>) -> Self {
+    fn new(ctx: Ctx, call_id: String, detector: Box<dyn TurnDetector>) -> Self {
         Self {
             ctx,
+            call_id,
+            responses: 0,
             detector,
             state: CallState::Listening,
             utterance: 0,
@@ -710,7 +740,7 @@ impl Call {
             response: None,
             finishing: None,
             pending_card: None,
-            client_reports: false,
+            client_reports: Arc::new(AtomicBool::new(false)),
             oversized_reported: false,
         }
     }
@@ -820,8 +850,10 @@ impl Call {
                 let eager = self.eager.take();
                 let stream = self.stream.take();
                 // Too short to have been a barge-in, said over a reply that
-                // is still going: a backchannel ("mm", "right") or echo.
-                if self.response.as_ref().is_some_and(|r| !r.cut)
+                // is playing: a backchannel ("mm", "right") or echo. Said
+                // while the reply is still being thought of, it is a turn
+                // ("no", "stop") and replaces that reply.
+                if self.response.as_ref().is_some_and(|r| r.playing)
                     && speech_ms < self.ctx.config.barge_in_ms
                 {
                     if let Some(eager) = eager {
@@ -833,10 +865,9 @@ impl Call {
                     self.restore_state();
                     return;
                 }
-                let speech_end = self.speech_end.take().or_else(|| {
-                    Instant::now()
-                        .checked_sub(Duration::from_millis(self.ctx.config.end_of_turn_ms as u64))
-                });
+                // A turn ends after a pause, which set `speech_end`; one cut
+                // off at `max_turn_ms` ends while the speaker is talking.
+                let speech_end = Some(self.speech_end.take().unwrap_or_else(Instant::now));
                 let streamed = stream.map(|stream| stream.finish(&audio));
                 let wav = wav_from_pcm16(&audio, SAMPLE_RATE);
                 self.start_response(
@@ -888,8 +919,19 @@ impl Call {
         });
     }
 
+    /// When a reply's estimated playback should be over, for a client that
+    /// does not report its own.
+    fn playback_deadline(&self) -> Option<Instant> {
+        if self.client_reports.load(Ordering::Relaxed) {
+            return None;
+        }
+        let response = self.response.as_ref().filter(|r| r.playing)?;
+        let end = response.shared.lock().expect("shared").estimated_end?;
+        Some(end + PLAYBACK_SLACK)
+    }
+
     fn expire_estimated_playback(&mut self) {
-        if self.client_reports {
+        if self.client_reports.load(Ordering::Relaxed) {
             return;
         }
         let over = self.response.as_ref().is_some_and(|r| {
@@ -898,7 +940,7 @@ impl Call {
                     .lock()
                     .expect("shared")
                     .estimated_end
-                    .is_some_and(|end| Instant::now() > end + PLAYBACK_SLACK)
+                    .is_some_and(|end| Instant::now() >= end + PLAYBACK_SLACK)
         });
         if over {
             let id = self
@@ -941,7 +983,7 @@ impl Call {
                 .shared
                 .lock()
                 .expect("shared")
-                .heard(self.client_reports);
+                .heard(self.client_reports.load(Ordering::Relaxed));
             let ctx = self.ctx.clone();
             let id = response.id;
             let previous = self.finishing.take();
@@ -965,7 +1007,8 @@ impl Call {
         if self.response.is_some() {
             self.barge_in();
         }
-        let id = format!("resp_{}", RESPONSES.fetch_add(1, Ordering::Relaxed));
+        self.responses += 1;
+        let id = format!("{}/resp_{}", self.call_id, self.responses);
         let cancel = CancellationToken::new();
         let shared = Arc::new(Mutex::new(Shared::default()));
         self.response = Some(ActiveResponse {
@@ -974,12 +1017,11 @@ impl Call {
             shared: Arc::clone(&shared),
             generating: true,
             playing: false,
-            cut: false,
         });
         self.set_state(CallState::Thinking);
         let ctx = self.ctx.clone();
         let previous = self.finishing.take();
-        let client_reports = self.client_reports;
+        let client_reports = Arc::clone(&self.client_reports);
         self.finishing = Some(tokio::spawn(async move {
             if let Some(previous) = previous {
                 let _ = previous.await;
@@ -1011,38 +1053,39 @@ impl Call {
             CallClientEvent::SessionUpdate { options } => {
                 self.ctx.providers.llm.session_update(options)
             }
-            CallClientEvent::ResponseCancel => {
-                if let Some(r) = self.response.as_mut() {
-                    r.cut = true;
-                }
-                self.barge_in();
-            }
+            CallClientEvent::ResponseCancel => self.barge_in(),
             CallClientEvent::OutputAudioStarted { response_id, index } => {
-                self.client_reports = true;
+                self.client_reports.store(true, Ordering::Relaxed);
                 if let Some(response) = self.response.as_ref().filter(|r| r.id == response_id) {
                     let mut shared = response.shared.lock().expect("shared");
                     shared.last_started = Some(shared.last_started.map_or(index, |i| i.max(index)));
                 }
             }
             CallClientEvent::OutputAudioIdle { response_id } => {
-                self.client_reports = true;
+                self.client_reports.store(true, Ordering::Relaxed);
                 self.playback_idle(&response_id);
             }
             CallClientEvent::ActionResolve { id, approve } => {
                 // The only road to `TurnRequest::Resolve`.
-                if self.pending_card.as_deref() != Some(id.as_str()) {
-                    self.ctx.send(CallServerEvent::Error {
-                        message: "no such approval card is waiting".into(),
-                    });
+                if self.pending_card.as_deref() == Some(id.as_str()) {
+                    self.resolve(id, approve);
                     return;
                 }
-                self.start_response(
-                    Trigger::Resolve {
+                // A card this call has not seen may have been raised
+                // elsewhere (a typed turn, another client): ask the host.
+                let approvals = Arc::clone(&self.ctx.providers.approvals);
+                let internal = self.ctx.internal.clone();
+                tokio::spawn(async move {
+                    let waiting = approvals
+                        .pending()
+                        .await
+                        .is_some_and(|card| card_id(&card).as_deref() == Some(id.as_str()));
+                    let _ = internal.send(Internal::ResolveChecked {
                         card_id: id,
                         approve,
-                    },
-                    None,
-                );
+                        waiting,
+                    });
+                });
             }
         }
     }
@@ -1071,8 +1114,27 @@ impl Call {
                     }
                 }
             }
+            Internal::ResolveChecked {
+                card_id,
+                approve,
+                waiting,
+            } => {
+                if waiting {
+                    self.pending_card = Some(card_id.clone());
+                    self.resolve(card_id, approve);
+                } else {
+                    self.ctx.send(CallServerEvent::Error {
+                        message: "no such approval card is waiting".into(),
+                    });
+                }
+            }
             Internal::Finished(finished) => self.finished(*finished),
         }
+    }
+
+    /// A button resolved `card_id`.
+    fn resolve(&mut self, card_id: String, approve: bool) {
+        self.start_response(Trigger::Resolve { card_id, approve }, None);
     }
 
     fn finished(&mut self, finished: Finished) {
@@ -1194,7 +1256,7 @@ async fn respond(
     cancel: CancellationToken,
     shared: Arc<Mutex<Shared>>,
     speech_end: Option<Instant>,
-    client_reports: bool,
+    client_reports: Arc<AtomicBool>,
 ) -> Finished {
     let mut times = Times {
         speech_end,
@@ -1216,8 +1278,20 @@ async fn respond(
             eager,
             streamed,
         } => {
+            // Cancelled while transcribing: stop the transcriptions too, or
+            // they go on calling the host's STT for a turn nobody wants.
+            let aborts: Vec<_> = streamed
+                .iter()
+                .map(JoinHandle::abort_handle)
+                .chain(eager.iter().map(JoinHandle::abort_handle))
+                .collect();
             let text = tokio::select! {
-                _ = cancel.cancelled() => return finished,
+                _ = cancel.cancelled() => {
+                    for abort in aborts {
+                        abort.abort();
+                    }
+                    return finished;
+                }
                 text = async {
                     if let Some(streamed) = streamed {
                         return match streamed.await {
@@ -1415,7 +1489,10 @@ async fn respond(
 
     // A cut response keeps only what was heard.
     if cancel.is_cancelled() {
-        let heard = shared.lock().expect("shared").heard(client_reports);
+        let heard = shared
+            .lock()
+            .expect("shared")
+            .heard(client_reports.load(Ordering::Relaxed));
         if recorded.is_some() && ctx.providers.llm.truncate_reply(heard.clone()).await {
             finished.text = Some(heard);
         }
@@ -1478,7 +1555,9 @@ async fn speak(
         let queued = Instant::now();
         let clip = match piece.clip {
             Some(clip) => Some(clip),
-            None if piece.end.is_none() && piece.text == ctx.config.filler => {
+            None if piece.end.is_none()
+                && ctx.config.fixed_lines().contains(&piece.text.as_str()) =>
+            {
                 ctx.canned(&piece.text).await
             }
             None => tokio::select! {
