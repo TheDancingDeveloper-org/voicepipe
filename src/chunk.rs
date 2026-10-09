@@ -20,6 +20,10 @@ use std::ops::Range;
 use crate::audio::{frame_dbfs, SAMPLE_RATE};
 
 /// Where turns are cut into chunks, in milliseconds of audio.
+///
+/// [`Chunker::new`] corrects settings that cannot work: `max_ms` below
+/// `min_ms` is raised to it, and a `search_ms` of 0 is taken as one 20 ms
+/// frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkConfig {
     /// A pause does not cut a chunk shorter than this; it waits to join the
@@ -71,7 +75,13 @@ pub struct Chunker {
 }
 
 impl Chunker {
+    /// A chunker for one turn.
     pub fn new(config: ChunkConfig) -> Self {
+        let config = ChunkConfig {
+            max_ms: config.max_ms.max(config.min_ms),
+            search_ms: config.search_ms.max(20),
+            ..config
+        };
         Self {
             config,
             committed: 0,
@@ -164,7 +174,7 @@ fn trim_trailing_quiet(audio: &[i16], keep_ms: u32) -> usize {
 
 /// The last `max_chars` or so of `text`, starting at a word: the context a
 /// chunk is transcribed with. Whisper reads it as the text before the clip.
-pub fn context_tail(text: &str, max_chars: usize) -> &str {
+pub(crate) fn context_tail(text: &str, max_chars: usize) -> &str {
     let text = text.trim();
     if text.len() <= max_chars {
         return text;
@@ -186,7 +196,7 @@ pub fn context_tail(text: &str, max_chars: usize) -> &str {
 /// repeats itself in a run: the two signs of a whisper decode that looped
 /// (it does, on a short clip given a prompt, or on a long silence) instead of
 /// transcribing.
-pub fn implausible(text: &str, seconds: f32) -> bool {
+pub(crate) fn implausible(text: &str, seconds: f32) -> bool {
     let words = text.split_whitespace().count() as f32;
     words > MAX_WORDS_PER_SECOND * seconds + 4.0
         || collapse_repeats(text) != text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -203,7 +213,7 @@ const LOOP_RUN: usize = 3;
 /// `text` with any phrase repeated `LOOP_RUN` or more times running cut back
 /// to one saying of it ("passed passed passed passed" → "passed"). Words are
 /// compared without case or punctuation.
-pub fn collapse_repeats(text: &str) -> String {
+pub(crate) fn collapse_repeats(text: &str) -> String {
     let words: Vec<&str> = text.split_whitespace().collect();
     let key = |w: &str| {
         w.trim_matches(|c: char| !c.is_alphanumeric())
@@ -267,6 +277,23 @@ mod tests {
         segment.extend(voice(1_200));
         segment.extend(hush(200));
         assert_eq!(chunker.at_pause(&segment), Some(first..segment.len()));
+    }
+
+    #[test]
+    fn settings_that_cannot_work_are_corrected() {
+        let mut chunker = Chunker::new(ChunkConfig {
+            min_ms: 1_000,
+            max_ms: 200,
+            search_ms: 0,
+            ..config()
+        });
+        // A max below the min would force a cut before a chunk is allowed;
+        // it is raised to the min, and the forced cut still lands.
+        let segment = voice(900);
+        assert_eq!(chunker.overlong(&segment), None);
+        let segment = voice(1_100);
+        let cut = chunker.overlong(&segment).expect("a forced cut");
+        assert!(cut.end >= ms(1_000) && cut.end <= segment.len(), "{cut:?}");
     }
 
     #[test]

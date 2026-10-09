@@ -18,6 +18,7 @@ pub trait Vad: Send {
     fn frame_len(&self) -> usize {
         320
     }
+    /// Whether `frame` (of `frame_len` samples) holds speech.
     fn is_speech(&mut self, frame: &[i16]) -> bool;
     /// The call's own reply is playing. A detector should demand more of a
     /// frame then: whatever the echo canceller leaves of the reply is the
@@ -70,6 +71,7 @@ const FLOOR_MIN_DB: f32 = -90.0;
 const FLOOR_MAX_DB: f32 = -25.0;
 
 impl EnergyVad {
+    /// A detector that calibrates its floor on the first frames it hears.
     pub fn new(config: EnergyVadConfig) -> Self {
         Self {
             config,
@@ -79,6 +81,7 @@ impl EnergyVad {
         }
     }
 
+    /// The noise floor as it stands, in dBFS.
     pub fn floor_db(&self) -> f32 {
         self.floor_db
     }
@@ -142,6 +145,9 @@ impl EarshotVad {
     /// Peak dither added to the detector's copy of a frame, in LSB.
     pub const DITHER: i16 = 32;
 
+    /// Speech is a score of at least `threshold` (0..=1), or of
+    /// `threshold + playback_extra` while the reply plays. The default is
+    /// 0.5 and 0.2.
     pub fn new(threshold: f32, playback_extra: f32) -> Self {
         Self {
             detector: earshot::Detector::default_boxed(),
