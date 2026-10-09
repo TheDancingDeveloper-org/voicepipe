@@ -73,7 +73,7 @@ impl Stt for FakeStt {
         };
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(delay)).await;
-            text.ok_or_else(|| ProviderError("chunk refused".into()))
+            text.ok_or_else(|| ProviderError::from("chunk refused"))
         })
     }
 }
@@ -279,7 +279,7 @@ fn is(kind: &'static str) -> impl Fn(&Value) -> bool {
     move |e| e["type"] == kind
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn opening_a_call_warms_the_transcriber_before_anyone_speaks() {
     let mut h = start(World::default());
     h.until(is("session.created")).await;
@@ -298,7 +298,7 @@ async fn opening_a_call_warms_the_transcriber_before_anyone_speaks() {
     assert!(!h.seen.iter().any(|e| e["type"] == "response.created"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_host_can_turn_the_warm_up_off() {
     let mut h = start_with(
         World::default(),
@@ -312,7 +312,7 @@ async fn a_host_can_turn_the_warm_up_off() {
     assert_eq!(h.world.lock().unwrap().stt_calls, 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_turn_is_heard_and_answered_a_sentence_at_a_time() {
     let mut h = start(World {
         transcript: "what is running".into(),
@@ -337,7 +337,7 @@ async fn a_turn_is_heard_and_answered_a_sentence_at_a_time() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_tool_round_before_any_text_is_covered_by_the_filler() {
     let mut h = start(World {
         transcript: "check the build".into(),
@@ -355,7 +355,7 @@ async fn a_tool_round_before_any_text_is_covered_by_the_filler() {
     assert_eq!(done["text"], "It passed.");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn talking_over_the_reply_stops_it_and_keeps_what_was_heard() {
     let mut h = start(World {
         transcript: "tell me everything".into(),
@@ -388,7 +388,7 @@ async fn talking_over_the_reply_stops_it_and_keeps_what_was_heard() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_short_sound_over_the_reply_does_not_stop_it() {
     let mut h = start(World {
         transcript: "go on".into(),
@@ -409,7 +409,7 @@ async fn a_short_sound_over_the_reply_does_not_stop_it() {
     assert!(!h.seen.iter().any(|e| e["type"] == "output_audio.clear"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn nothing_said_resolves_a_card_and_the_button_does() {
     let card = json!({"id": "card-1", "kind": "anything"});
     let mut h = start(World {
@@ -422,8 +422,8 @@ async fn nothing_said_resolves_a_card_and_the_button_does() {
     });
     h.until(is("session.created")).await;
     h.speak(&utterance()).await;
-    let shown = h.until(is("assistant.pending_action")).await;
-    assert_eq!(shown["action"], card);
+    let shown = h.until(is("approval.pending")).await;
+    assert_eq!(shown["card"], card);
     let done = h.until(is("response.done")).await;
     assert_eq!(done["status"], "pending_approval");
 
@@ -447,7 +447,7 @@ async fn nothing_said_resolves_a_card_and_the_button_does() {
 
     h.control(json!({"type": "action.resolve", "id": "card-1", "approve": true}))
         .await;
-    let resolved = h.until(is("assistant.action_resolved")).await;
+    let resolved = h.until(is("approval.resolved")).await;
     assert_eq!(resolved["approved"], true);
     let done = h.until(is("response.done")).await;
     assert_eq!(done["text"], "Done.");
@@ -460,7 +460,7 @@ async fn nothing_said_resolves_a_card_and_the_button_does() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_button_for_a_card_that_is_not_waiting_is_refused() {
     let mut h = start(World::default());
     h.until(is("session.created")).await;
@@ -491,7 +491,7 @@ fn warm_off(world: World) -> Harness {
     )
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_turn_is_transcribed_in_chunks_while_it_is_spoken() {
     let mut h = warm_off(World {
         chunk_texts: vec![
@@ -528,7 +528,7 @@ async fn a_turn_is_transcribed_in_chunks_while_it_is_spoken() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_transcript_is_ready_when_the_turn_ends_not_after() {
     // A slow transcriber: each chunk takes 300 ms. Streamed, the first
     // phrase is done while the second is spoken, and at the end only the
@@ -550,7 +550,7 @@ async fn the_transcript_is_ready_when_the_turn_ends_not_after() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_failed_chunk_falls_back_to_the_whole_clip() {
     let mut h = warm_off(World {
         transcript: "the whole thing".into(),
@@ -570,7 +570,7 @@ async fn a_failed_chunk_falls_back_to_the_whole_clip() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_chunk_that_heard_no_words_adds_none() {
     let mut h = warm_off(World {
         chunk_texts: vec![Some("[BLANK_AUDIO]".into()), Some("hello".into())],
@@ -586,7 +586,7 @@ async fn a_chunk_that_heard_no_words_adds_none() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_spoken_yes_streamed_in_chunks_still_never_approves() {
     let card = json!({"id": "card-9", "kind": "anything"});
     let mut h = warm_off(World {
@@ -596,7 +596,7 @@ async fn a_spoken_yes_streamed_in_chunks_still_never_approves() {
     });
     h.until(is("session.created")).await;
     h.speak(&utterance()).await;
-    h.until(is("assistant.pending_action")).await;
+    h.until(is("approval.pending")).await;
     h.until(is("response.done")).await;
     h.world.lock().unwrap().chunk_texts = vec![Some("yes".into()), Some("approve it".into())];
     h.speak(&two_phrases()).await;
@@ -615,7 +615,7 @@ async fn a_spoken_yes_streamed_in_chunks_still_never_approves() {
     assert!(w.card.is_some(), "the card still waits");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn whole_clip_mode_transcribes_the_turn_as_one_clip() {
     let mut h = start_with(
         World {
@@ -643,7 +643,7 @@ async fn whole_clip_mode_transcribes_the_turn_as_one_clip() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_chunk_that_loops_is_retried_without_its_context() {
     let mut h = warm_off(World {
         chunk_texts: vec![
@@ -670,4 +670,38 @@ async fn a_chunk_that_loops_is_retried_without_its_context() {
         vec![String::new(), "check the build".into(), String::new()],
         "the retry went without the context"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_call_opens_with_the_protocol_version() {
+    let mut h = start(World::default());
+    let created = h.until(is("session.created")).await;
+    assert_eq!(created["protocol"], voicepipe::PROTOCOL_VERSION);
+    assert_eq!(created["sample_rate"], RATE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_oversized_audio_frame_is_dropped_and_reported_once() {
+    let mut h = warm_off(World::default());
+    h.until(is("session.created")).await;
+    let big = Bytes::from(vec![0u8; voicepipe::MAX_AUDIO_FRAME_BYTES + 2]);
+    for _ in 0..3 {
+        h.tx.send(Inbound::Audio(big.clone())).await.unwrap();
+    }
+    h.control(json!({"type": "ping"})).await;
+    h.until(is("pong")).await;
+    let errors: Vec<_> = h.seen.iter().filter(|e| e["type"] == "error").collect();
+    assert_eq!(errors.len(), 1, "{:#?}", h.seen);
+}
+
+#[test]
+fn a_provider_error_carries_its_source() {
+    use std::error::Error;
+    let io = std::io::Error::other("connection reset");
+    let error = ProviderError::with_source("transcriber unreachable", io);
+    assert_eq!(error.to_string(), "transcriber unreachable");
+    assert_eq!(error.source().unwrap().to_string(), "connection reset");
+    let plain: ProviderError = "timed out".into();
+    assert_eq!(plain.message(), "timed out");
+    assert!(plain.source().is_none());
 }

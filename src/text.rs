@@ -29,6 +29,7 @@ pub struct SentenceChunker {
 }
 
 impl SentenceChunker {
+    /// An empty chunker, for one reply.
     pub fn new() -> Self {
         Self::default()
     }

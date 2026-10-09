@@ -36,12 +36,22 @@ pub trait TurnDetector: Send {
 /// Turn-taking timings, in milliseconds of audio.
 #[derive(Debug, Clone, Copy)]
 pub struct EndpointConfig {
+    /// Voice needed to start a turn; a click or a cough is shorter.
     pub onset_ms: u32,
+    /// Voice in the utterance before `Sustained` is reported: the bar a
+    /// barge-in must clear.
     pub sustained_ms: u32,
+    /// Silence that counts as a pause. Keep it below `end_of_turn_ms`, or
+    /// the turn ends before a pause is ever reported.
     pub pause_ms: u32,
+    /// Silence that ends the turn.
     pub end_of_turn_ms: u32,
+    /// Voice an utterance needs to be a turn rather than `Discarded`.
     pub min_speech_ms: u32,
+    /// The longest turn; at this length it ends whatever the speaker does.
     pub max_turn_ms: u32,
+    /// Audio from before the onset kept at the start of the utterance, so
+    /// the first syllable is not clipped.
     pub pre_roll_ms: u32,
 }
 
@@ -59,13 +69,21 @@ impl Default for EndpointConfig {
     }
 }
 
+/// What the turn detector reports. See the module docs for when.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum EndpointEvent {
+    /// A turn began.
     SpeechStarted,
+    /// The utterance has held `sustained_ms` of voice.
     Sustained,
+    /// The speaker paused for `pause_ms`.
     PauseBegan,
+    /// Voice came back before the turn ended.
     SpeechResumed,
+    /// The turn is over.
     EndOfTurn {
+        /// The utterance, pre-roll included.
         audio: Vec<i16>,
         /// Milliseconds of voiced audio in the utterance.
         speech_ms: u32,
@@ -103,6 +121,7 @@ pub struct Endpointer<V: Vad> {
 }
 
 impl<V: Vad> Endpointer<V> {
+    /// A detector with these timings, asking `vad` about each frame.
     pub fn new(config: EndpointConfig, vad: V) -> Self {
         let frame_len = vad.frame_len().max(1);
         let frame_ms = (frame_len as u32 * 1000 / SAMPLE_RATE).max(1);

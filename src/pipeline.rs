@@ -42,18 +42,19 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::{pcm16_from_le_bytes, wav_duration, wav_from_pcm16, SAMPLE_RATE};
 use crate::chunk::{collapse_repeats, context_tail, implausible, ChunkConfig, Chunker};
 use crate::protocol::{
-    CallClientEvent, CallMetrics, CallResponseStatus, CallServerEvent, CallState,
+    CallClientEvent, CallMetrics, CallResponseStatus, CallServerEvent, CallState, PROTOCOL_VERSION,
 };
 use crate::text::{speakable, SentenceChunker};
 use crate::turn::{EndpointConfig, EndpointEvent, TurnDetector};
@@ -62,27 +63,83 @@ use crate::turn::{EndpointConfig, EndpointEvent, TurnDetector};
 /// the traits stay object-safe.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// A provider's failure, in words for a log line.
+/// A provider's failure: words for a log line, and the error behind it if
+/// there was one.
+///
+/// The message is what the pipeline shows: a failed turn sends it to the
+/// client in an `error` event. Build one from a string (`"timed out".into()`)
+/// or around the underlying error with [`ProviderError::with_source`].
 #[derive(Debug, Clone)]
-pub struct ProviderError(pub String);
+pub struct ProviderError {
+    message: String,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
+}
 
-impl std::fmt::Display for ProviderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+impl ProviderError {
+    /// A failure described in words.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// A failure described in words, caused by `source`.
+    pub fn with_source(
+        message: impl Into<String>,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(Arc::from(source.into())),
+        }
+    }
+
+    /// The words.
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
-impl std::error::Error for ProviderError {}
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl From<String> for ProviderError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for ProviderError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
 
 /// One synthesized clip, in whatever container the TTS produced.
 #[derive(Debug, Clone)]
 pub struct Clip {
+    /// The audio's media type (`audio/wav`, `audio/mpeg`, ...), passed to
+    /// the client as it is.
     pub content_type: String,
+    /// The clip, whole.
     pub bytes: Bytes,
 }
 
 /// Speech to text: one utterance (a 16 kHz mono PCM16 WAV) to its words.
 pub trait Stt: Send + Sync {
+    /// The words in `wav`, a whole clip.
     fn transcribe(&self, wav: Vec<u8>) -> BoxFuture<'_, Result<String, ProviderError>>;
 
     /// One chunk of a turn that is still being spoken. `context` is the
@@ -101,6 +158,7 @@ pub trait Stt: Send + Sync {
 
 /// Text to speech: one piece of a reply to one clip.
 pub trait Tts: Send + Sync {
+    /// `text`, spoken. The text has already been through [`speakable`].
     fn synthesize(&self, text: String) -> BoxFuture<'_, Result<Clip, ProviderError>>;
 }
 
@@ -123,19 +181,33 @@ pub enum TurnRequest {
     Utterance(String),
     /// A button resolved approval card `card_id`. Built only from an
     /// `action.resolve` control frame, never from speech.
-    Resolve { card_id: String, approve: bool },
+    Resolve {
+        /// The card's `id`.
+        card_id: String,
+        /// Approve (`true`) or deny.
+        approve: bool,
+    },
 }
 
 /// How a turn ended.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnOutcome {
     /// The reply, as the host recorded it.
-    Completed { reply: Option<String> },
+    Completed {
+        /// The reply text, if the host keeps one.
+        reply: Option<String>,
+    },
     /// Cut short by the cancel token; the part produced by then.
-    Interrupted { reply: Option<String> },
+    Interrupted {
+        /// The reply text produced before the cut, if the host keeps one.
+        reply: Option<String>,
+    },
     /// The turn proposed something that needs approval: the host's card, a
     /// JSON object with a string `id`, shown to the user to press.
-    AwaitingApproval { card: Value },
+    AwaitingApproval {
+        /// The card, sent to the client in `approval.pending`.
+        card: Value,
+    },
 }
 
 /// The host's turn — whatever turns an utterance into a reply.
@@ -170,8 +242,11 @@ pub trait Approvals: Send + Sync {
 /// A finished response, for a host's log line.
 #[derive(Debug, Clone)]
 pub struct ResponseReport {
+    /// The response's id.
     pub response_id: String,
+    /// How it ended.
     pub status: CallResponseStatus,
+    /// Where its time went.
     pub metrics: CallMetrics,
 }
 
@@ -181,9 +256,13 @@ pub type Observer = Arc<dyn Fn(&ResponseReport) + Send + Sync>;
 /// Everything a call is built from.
 #[derive(Clone)]
 pub struct Providers {
+    /// Speech to text.
     pub stt: Arc<dyn Stt>,
+    /// Text to speech.
     pub tts: Arc<dyn Tts>,
+    /// The host's turn.
     pub llm: Arc<dyn Llm>,
+    /// The host's approval cards.
     pub approvals: Arc<dyn Approvals>,
     /// Told about every finished response.
     pub observer: Option<Observer>,
@@ -209,7 +288,9 @@ pub struct CallConfig {
     pub end_of_turn_ms: u32,
     /// Voice needed, over a reply, to stop it.
     pub barge_in_ms: u32,
-    /// Silence that counts as a pause (and starts an early transcription).
+    /// Silence that counts as a pause (and starts an early transcription,
+    /// or cuts a chunk). Keep it below `end_of_turn_ms`: a pause as long as
+    /// the end of the turn is never reported.
     pub pause_ms: u32,
     /// How a turn is transcribed.
     pub stt_mode: SttMode,
@@ -277,13 +358,16 @@ pub enum Inbound {
 /// To the client.
 #[derive(Debug, Clone)]
 pub enum Outbound {
+    /// An event, for a text frame (serialize it as JSON).
     Event(CallServerEvent),
     /// The clip announced by the `response.audio.start` just before it.
     Audio(Bytes),
 }
 
-/// The largest audio frame accepted: two seconds at 16 kHz.
-const MAX_AUDIO_FRAME_BYTES: usize = 64 * 1024;
+/// The largest audio frame accepted, about two seconds at 16 kHz. A larger
+/// one is dropped, and the first of them in a call is reported with an
+/// `error` event.
+pub const MAX_AUDIO_FRAME_BYTES: usize = 64 * 1024;
 /// A partial caption needs at least this much of the turn to say anything.
 const MIN_PARTIAL_MS: u32 = 800;
 /// The silence transcribed to warm the transcriber as a call opens.
@@ -295,6 +379,14 @@ const CONTEXT_CHARS: usize = 200;
 const PLAYBACK_SLACK: Duration = Duration::from_millis(1_500);
 
 /// Run one call until `inbound` closes.
+///
+/// `run` spawns tasks, so it must be called inside a tokio runtime. When it
+/// returns, a host turn or a `truncate_reply` still under way may finish
+/// after it; nothing is sent once `outbound`'s receiver is gone.
+///
+/// `outbound` is unbounded: the pipeline never waits for a slow client.
+/// What it sends is bounded by the reply's length, one clip per sentence.
+/// Audio frames larger than [`MAX_AUDIO_FRAME_BYTES`] are dropped.
 pub async fn run(
     call_id: String,
     config: CallConfig,
@@ -336,6 +428,7 @@ pub async fn run(
     }
     let mut call = Call::new(ctx, turn_detector);
     call.ctx.send(CallServerEvent::SessionCreated {
+        protocol: PROTOCOL_VERSION,
         call_id,
         sample_rate: SAMPLE_RATE,
         end_of_turn_ms: call.ctx.config.end_of_turn_ms,
@@ -598,6 +691,8 @@ struct Call {
     finishing: Option<JoinHandle<()>>,
     pending_card: Option<String>,
     client_reports: bool,
+    /// An oversized audio frame has been reported already.
+    oversized_reported: bool,
 }
 
 impl Call {
@@ -616,6 +711,7 @@ impl Call {
             finishing: None,
             pending_card: None,
             client_reports: false,
+            oversized_reported: false,
         }
     }
 
@@ -645,6 +741,15 @@ impl Call {
 
     fn audio(&mut self, bytes: &[u8]) {
         if bytes.len() > MAX_AUDIO_FRAME_BYTES {
+            if !self.oversized_reported {
+                self.oversized_reported = true;
+                self.ctx.send(CallServerEvent::Error {
+                    message: format!(
+                        "audio frame of {} bytes dropped; the most is {MAX_AUDIO_FRAME_BYTES}",
+                        bytes.len()
+                    ),
+                });
+            }
             return;
         }
         self.expire_estimated_playback();
@@ -977,13 +1082,12 @@ impl Call {
             }
             if let Some(approved) = outcome {
                 self.ctx
-                    .send(CallServerEvent::ActionResolved { id, approved });
+                    .send(CallServerEvent::ApprovalResolved { id, approved });
             }
         }
         if let Some(card) = finished.pending {
             self.pending_card = card_id(&card);
-            self.ctx
-                .send(CallServerEvent::PendingAction { action: card });
+            self.ctx.send(CallServerEvent::ApprovalPending { card });
         }
         if let Some(status) = finished.status {
             if let Some(observer) = &self.ctx.providers.observer {
@@ -1042,7 +1146,7 @@ async fn transcribe(stt: &dyn Stt, wav: Vec<u8>) -> Option<String> {
 /// Whisper-family transcribers describe what they heard when it was not
 /// speech — `[BLANK_AUDIO]`, `(silence)`, `[Music]` — and a turn made of
 /// nothing else is no turn.
-pub fn is_non_speech(text: &str) -> bool {
+pub(crate) fn is_non_speech(text: &str) -> bool {
     let mut rest = text.trim();
     loop {
         rest = rest.trim_start();

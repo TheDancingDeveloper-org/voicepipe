@@ -173,12 +173,12 @@ text: `session.update`, `response.cancel`, `output_audio.started` /
 `output_audio.idle` (playback reports, which make "what was heard" exact),
 `action.resolve` (the approval button) and `ping`. The server answers with
 JSON events named, where the meaning is the same, after the OpenAI Realtime
-API's: `session.created`, `call.state`,
+API's: `session.created` (which carries the protocol version), `call.state`,
 `input_audio_buffer.speech_started`, transcription captions,
 `response.created`, `response.text.delta`, `response.audio.start` followed by
 one binary frame holding that piece's clip, `response.done` with metrics,
-`output_audio.clear`, `conversation.item.truncated`, and
-`assistant.pending_action` / `assistant.action_resolved`. The types are in the `protocol` module.
+`output_audio.clear`, `conversation.item.truncated`, and `approval.pending` /
+`approval.resolved`. The types are in the `protocol` module.
 
 ## Status
 

@@ -15,14 +15,24 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The version of this protocol, sent in `session.created`. It goes up with
+/// any change a client could notice: an event or field renamed or removed,
+/// or a meaning changed. New events and new fields do not change it; a
+/// client ignores what it does not know.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// What a call client sends, as text frames.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum CallClientEvent {
     /// The conventional first frame, for hosts that authenticate in-band.
     /// The host checks it; the pipeline ignores it.
     #[serde(rename = "auth")]
-    Auth { token: String },
+    Auth {
+        /// The client's credential, in whatever form the host takes.
+        token: String,
+    },
     /// Per-call options for the host's turns.
     #[serde(rename = "session.update")]
     SessionUpdate {
@@ -37,15 +47,29 @@ pub enum CallClientEvent {
     /// The client began playing piece `index` of `response_id`. What was
     /// heard of an interrupted reply is reckoned from these.
     #[serde(rename = "output_audio.started")]
-    OutputAudioStarted { response_id: String, index: u32 },
+    OutputAudioStarted {
+        /// The response the piece belongs to.
+        response_id: String,
+        /// The piece, as numbered in its `response.audio.start`.
+        index: u32,
+    },
     /// The client's playback queue for `response_id` ran dry: nothing of the
     /// reply is coming out of the speaker any more.
     #[serde(rename = "output_audio.idle")]
-    OutputAudioIdle { response_id: String },
+    OutputAudioIdle {
+        /// The response whose audio ran out.
+        response_id: String,
+    },
     /// A button press on the approval card. Never sent for speech: a spoken
     /// "yes" is not an approval, and the server never treats one as one.
     #[serde(rename = "action.resolve")]
-    ActionResolve { id: String, approve: bool },
+    ActionResolve {
+        /// The card's `id`, from its `approval.pending`.
+        id: String,
+        /// Approve (`true`) or deny.
+        approve: bool,
+    },
+    /// Keep-alive; answered with `pong`.
     #[serde(rename = "ping")]
     Ping,
 }
@@ -53,6 +77,7 @@ pub enum CallClientEvent {
 /// Where the call is, for the client's status line.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CallState {
     /// Waiting for the user to speak.
     Listening,
@@ -69,18 +94,22 @@ pub enum CallState {
 /// How a response ended.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CallResponseStatus {
+    /// The reply was given in full.
     Completed,
     /// Cut short by a barge-in or `response.cancel`.
     Interrupted,
     /// The turn proposed a change and stopped at the approval gate.
     PendingApproval,
+    /// The host's turn failed; an `error` event says why.
     Failed,
 }
 
 /// Where a response's time went, in milliseconds. Every field is `None` when
 /// that stage did not happen (no tool round, no audio before a cut, …).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct CallMetrics {
     /// Last voiced audio → the end of the turn was declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,17 +138,30 @@ pub struct CallMetrics {
 /// What the server sends, as text frames.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum CallServerEvent {
     /// The call is up. Audio is expected at `sample_rate`.
     #[serde(rename = "session.created")]
     SessionCreated {
+        /// [`PROTOCOL_VERSION`] of the server.
+        protocol: u32,
+        /// The host's name for this call.
         call_id: String,
+        /// Samples per second of the audio the client sends.
         sample_rate: u32,
+        /// Silence, in milliseconds, that ends the user's turn.
         end_of_turn_ms: u32,
+        /// Voice, in milliseconds, that stops a reply when the user talks
+        /// over it.
         barge_in_ms: u32,
     },
+    /// The call moved to `state`.
     #[serde(rename = "call.state")]
-    State { state: CallState },
+    State {
+        /// Where the call is now.
+        state: CallState,
+    },
+    /// The user began a turn.
     #[serde(rename = "input_audio_buffer.speech_started")]
     SpeechStarted,
     /// The user's turn ended.
@@ -128,48 +170,96 @@ pub enum CallServerEvent {
     /// The turn so far, re-transcribed while the user is still speaking. The
     /// whole text each time, not an increment.
     #[serde(rename = "conversation.item.input_audio_transcription.partial")]
-    TranscriptionPartial { text: String },
+    TranscriptionPartial {
+        /// The words so far.
+        text: String,
+    },
+    /// The turn's transcript, as the host's turn will get it.
     #[serde(rename = "conversation.item.input_audio_transcription.completed")]
-    TranscriptionCompleted { text: String },
+    TranscriptionCompleted {
+        /// The words.
+        text: String,
+    },
+    /// A response began.
     #[serde(rename = "response.created")]
-    ResponseCreated { response_id: String },
+    ResponseCreated {
+        /// The response's id, unique within the call.
+        response_id: String,
+    },
+    /// More of the reply's text.
     #[serde(rename = "response.text.delta")]
-    ResponseTextDelta { response_id: String, delta: String },
+    ResponseTextDelta {
+        /// The response it belongs to.
+        response_id: String,
+        /// The new text, to append.
+        delta: String,
+    },
     /// Piece `index` of the reply; the next frame is its audio, binary.
     #[serde(rename = "response.audio.start")]
     ResponseAudioStart {
+        /// The response it belongs to.
         response_id: String,
+        /// The piece's place in the response, from 0.
         index: u32,
+        /// What the piece says.
         text: String,
+        /// The audio's media type (`audio/wav`, `audio/mpeg`, ...).
         content_type: String,
+        /// The length of the binary frame that follows.
         bytes: u64,
     },
+    /// A response ended.
     #[serde(rename = "response.done")]
     ResponseDone {
+        /// The response that ended.
         response_id: String,
+        /// How it ended.
         status: CallResponseStatus,
         /// The reply as recorded — for an interrupted reply, what was heard.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// Where its time went.
         metrics: CallMetrics,
     },
     /// Stop playing `response_id` now and drop whatever is queued.
     #[serde(rename = "output_audio.clear")]
-    OutputAudioClear { response_id: String },
+    OutputAudioClear {
+        /// The response to silence.
+        response_id: String,
+    },
     /// A reply that had finished generating was cut while it was being
     /// spoken; the conversation now records only `text`, what was heard
     /// (empty: nothing of it was, and it was removed).
     #[serde(rename = "conversation.item.truncated")]
-    ItemTruncated { response_id: String, text: String },
+    ItemTruncated {
+        /// The response that was cut.
+        response_id: String,
+        /// What was heard of it.
+        text: String,
+    },
     /// A change the host wants approved: the host's own card, opaque here,
     /// with a string `id`. It happens only if the card's button is pressed
     /// (`action.resolve`).
-    #[serde(rename = "assistant.pending_action")]
-    PendingAction { action: serde_json::Value },
-    #[serde(rename = "assistant.action_resolved")]
-    ActionResolved { id: String, approved: bool },
+    #[serde(rename = "approval.pending")]
+    ApprovalPending {
+        /// The host's card.
+        card: serde_json::Value,
+    },
+    /// A card was approved or denied by its button.
+    #[serde(rename = "approval.resolved")]
+    ApprovalResolved {
+        /// The card's `id`.
+        id: String,
+        /// Whether it was approved.
+        approved: bool,
+    },
+    /// Something went wrong; the call goes on.
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        /// What, in words.
+        message: String,
+    },
+    /// The answer to `ping`.
     #[serde(rename = "pong")]
     Pong,
 }
