@@ -13,7 +13,9 @@
 const FIRST_CLAUSE_MIN_WORDS: usize = 4;
 
 /// A run of text this long with no boundary is cut at its last space — a
-/// model that writes a paragraph-long sentence still gets spoken.
+/// model that writes a paragraph-long sentence still gets spoken. A run with
+/// no space at all (a URL, a hash) is not cut: it waits for a boundary or
+/// the end of the reply.
 const MAX_PIECE_CHARS: usize = 240;
 
 /// Abbreviations whose full stop does not end a sentence.

@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use voicepipe::{
     run, Approvals, BoxFuture, CallConfig, Clip, Endpointer, EnergyVad, EnergyVadConfig, Inbound,
-    Llm, LlmEvent, LlmSink, Outbound, ProviderError, Providers, Stt, SttMode, Tts, TurnOutcome,
-    TurnRequest,
+    Llm, LlmEvent, LlmSink, Outbound, ProviderError, Providers, Stt, SttMode, Tts, TurnDetector,
+    TurnOutcome, TurnRequest, Vad,
 };
 
 const RATE: u32 = 16_000;
@@ -32,6 +32,10 @@ struct World {
     whole_calls: usize,
     /// How long a chunk takes to transcribe.
     chunk_delay_ms: u64,
+    /// Chunk transcriptions that ran to the end.
+    chunks_done: usize,
+    /// How long the model thinks before its first word.
+    llm_delay_ms: u64,
     /// Scripted replies, in order: (tool round first?, text, card?).
     replies: Vec<(bool, String, Option<Value>)>,
     requests: Vec<TurnRequest>,
@@ -71,8 +75,10 @@ impl Stt for FakeStt {
             };
             (text, world.chunk_delay_ms)
         };
+        let world = Arc::clone(&self.0);
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(delay)).await;
+            world.lock().unwrap().chunks_done += 1;
             text.ok_or_else(|| ProviderError::from("chunk refused"))
         })
     }
@@ -107,18 +113,23 @@ impl Llm for FakeLlm {
     ) -> BoxFuture<'_, Result<TurnOutcome, ProviderError>> {
         let world = Arc::clone(&self.0);
         Box::pin(async move {
-            let (tools, text, card) = {
+            let (delay, (tools, text, card)) = {
                 let mut w = world.lock().unwrap();
                 w.requests.push(request.clone());
                 if let TurnRequest::Resolve { .. } = request {
                     w.card = None;
                 }
-                if w.replies.is_empty() {
+                let reply = if w.replies.is_empty() {
                     (false, "script exhausted".to_string(), None)
                 } else {
                     w.replies.remove(0)
-                }
+                };
+                (w.llm_delay_ms, reply)
             };
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(TurnOutcome::Interrupted { reply: None }),
+                _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+            }
             if tools {
                 sink(LlmEvent::ToolRound);
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -178,11 +189,15 @@ fn start(world: World) -> Harness {
 }
 
 fn start_with(world: World, config: CallConfig) -> Harness {
-    let world = Arc::new(Mutex::new(world));
     let detector = Box::new(Endpointer::new(
         config.endpoint_config(),
         EnergyVad::new(EnergyVadConfig::default()),
     ));
+    start_detecting(world, config, detector)
+}
+
+fn start_detecting(world: World, config: CallConfig, detector: Box<dyn TurnDetector>) -> Harness {
+    let world = Arc::new(Mutex::new(world));
     let providers = Providers {
         stt: Arc::new(FakeStt(Arc::clone(&world))),
         tts: Arc::new(FakeTts(Arc::clone(&world))),
@@ -704,4 +719,186 @@ fn a_provider_error_carries_its_source() {
     let plain: ProviderError = "timed out".into();
     assert_eq!(plain.message(), "timed out");
     assert!(plain.source().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_short_word_while_the_reply_is_being_thought_of_is_a_turn() {
+    let mut h = warm_off(World {
+        transcript: "delete the branch".into(),
+        replies: vec![
+            (false, "Deleting it now.".into(), None),
+            (false, "Stopped.".into(), None),
+        ],
+        llm_delay_ms: 3_000,
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.speak(&utterance()).await;
+    let first = h.until(is("response.created")).await;
+    // "no": shorter than the barge-in bar, but nothing is playing yet.
+    h.world.lock().unwrap().transcript = "no".into();
+    let mut no = quiet(50);
+    no.extend(tone(300, 0.3));
+    no.extend(quiet(1_000));
+    h.speak(&no).await;
+    let cut = h
+        .until(|e| e["type"] == "response.done" && e["response_id"] == first["response_id"])
+        .await;
+    assert_eq!(cut["status"], "interrupted");
+    let done = h
+        .until(|e| e["type"] == "response.done" && e["response_id"] != first["response_id"])
+        .await;
+    assert_eq!(done["text"], "Stopped.");
+    assert_eq!(
+        h.world.lock().unwrap().requests,
+        vec![
+            TurnRequest::Utterance("delete the branch".into()),
+            TurnRequest::Utterance("no".into()),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_first_reply_of_a_call_is_cut_where_the_client_says() {
+    // The client reports piece 1 playing before the clock estimate would
+    // have it start: what was heard follows the report, from the first
+    // response on.
+    let mut h = warm_off(World {
+        transcript: "tell me everything".into(),
+        replies: vec![(
+            false,
+            "First one here. Second one here. Third one here.".into(),
+            None,
+        )],
+        tts_delay_ms: 100,
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.speak(&utterance()).await;
+    let first = h.until(is("response.audio.start")).await;
+    let id = first["response_id"].clone();
+    h.until(|e| e["type"] == "response.audio.start" && e["index"] == 1)
+        .await;
+    for index in [0, 1] {
+        h.control(json!({"type": "output_audio.started", "response_id": id, "index": index}))
+            .await;
+    }
+    let mut over = quiet(100);
+    over.extend(tone(800, 0.5));
+    h.speak(&over).await;
+    let done = h
+        .until(|e| e["type"] == "response.done" && e["response_id"] == id)
+        .await;
+    assert_eq!(done["status"], "interrupted");
+    assert_eq!(done["text"], "First one here. Second one here.");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_while_transcribing_stops_the_transcription() {
+    let mut h = warm_off(World {
+        chunk_texts: vec![Some("one".into()), Some("two".into())],
+        chunk_delay_ms: 2_000,
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.speak(&two_phrases()).await;
+    h.until(is("input_audio_buffer.speech_stopped")).await;
+    h.control(json!({"type": "response.cancel"})).await;
+    let done_at_cancel = h.world.lock().unwrap().chunks_done;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let w = h.world.lock().unwrap();
+    assert_eq!(
+        w.chunks_done, done_at_cancel,
+        "a chunk ran on after the cancel"
+    );
+    assert!(w.requests.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_button_resolves_a_card_raised_elsewhere() {
+    let card = json!({"id": "card-9"});
+    let mut h = warm_off(World {
+        card: Some(card),
+        replies: vec![(false, "Done.".into(), None)],
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.control(json!({"type": "action.resolve", "id": "card-9", "approve": false}))
+        .await;
+    let resolved = h.until(is("approval.resolved")).await;
+    assert_eq!(resolved["approved"], false);
+    assert_eq!(
+        h.world.lock().unwrap().requests,
+        vec![TurnRequest::Resolve {
+            card_id: "card-9".into(),
+            approve: false
+        }]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn response_ids_belong_to_their_call() {
+    let mut h = warm_off(World {
+        transcript: "hello".into(),
+        replies: vec![(false, "Hi.".into(), None)],
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.speak(&utterance()).await;
+    let created = h.until(is("response.created")).await;
+    assert_eq!(created["response_id"], "call-1/resp_1");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_client_still_hears_the_reply_end() {
+    // No audio after the turn and no playback reports: the reply's
+    // estimated end alone moves the call from speaking back to listening.
+    let mut h = warm_off(World {
+        transcript: "hello".into(),
+        replies: vec![(false, "Hi.".into(), None)],
+        ..World::default()
+    });
+    h.until(is("session.created")).await;
+    h.speak(&utterance()).await;
+    h.until(|e| e["type"] == "call.state" && e["state"] == "speaking")
+        .await;
+    h.until(|e| e["type"] == "call.state" && e["state"] == "listening")
+        .await;
+}
+
+/// Speech is anything louder than room noise. Unlike the energy detector it
+/// never learns a long steady tone as the noise floor.
+struct Loudness;
+impl Vad for Loudness {
+    fn is_speech(&mut self, frame: &[i16]) -> bool {
+        frame.iter().any(|s| s.unsigned_abs() > 1_000)
+    }
+    fn set_playback(&mut self, _playing: bool) {}
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_turn_cut_off_at_its_longest_ends_where_it_was_cut() {
+    let config = CallConfig {
+        warm_stt: false,
+        ..CallConfig::default()
+    };
+    let detector = Box::new(Endpointer::new(config.endpoint_config(), Loudness));
+    let mut h = start_detecting(
+        World {
+            transcript: "a very long story".into(),
+            replies: vec![(false, "Go on.".into(), None)],
+            ..World::default()
+        },
+        config,
+        detector,
+    );
+    h.until(is("session.created")).await;
+    // With the pre-roll the turn reaches 30 s, the most, inside the tone;
+    // the silence after it starts nothing new.
+    let mut audio = quiet(300);
+    audio.extend(tone(29_900, 0.3));
+    audio.extend(quiet(1_500));
+    h.speak(&audio).await;
+    let done = h.until(is("response.done")).await;
+    assert_eq!(done["metrics"]["endpoint_ms"], 0, "{done:#?}");
 }
