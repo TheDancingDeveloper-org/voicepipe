@@ -36,3 +36,10 @@ token.
 
 Pushing the `v0.1.0` tag after the hand publish is safe: the workflow finds
 that version on crates.io and skips the publish step.
+
+## CodeQL
+
+`.github/workflows/codeql.yml` runs only when a release is cut: on a `v*` tag
+push or on demand (`workflow_dispatch`). It does not run on pull requests,
+merge groups, pushes to `main` or a schedule, so `analyze (rust)` is not a
+PR check.
