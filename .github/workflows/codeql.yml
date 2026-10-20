@@ -1,12 +1,12 @@
+# CodeQL runs only when a release build is cut: on a `v*` tag push, which is
+# what release.yml publishes from, or on demand. It does not run on
+# pull_request, merge_group, pushes to main or a schedule. See
+# docs/RELEASING.md.
 name: codeql
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  schedule:
-    - cron: "41 4 * * 1"
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
